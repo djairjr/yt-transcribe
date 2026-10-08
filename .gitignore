@@ -8,3 +8,10 @@
 # Test artifacts: downloaded media, ONNX models, generated transcripts.
 /test-data/
 /models/
+
+# Build output: the .deb is produced by packaging/build-deb.sh.
+/*.deb
+
+# Windows cross build (FFmpeg for mingw; see scripts/build-ffmpeg-win.sh).
+/third_party/ffmpeg-win-install/
+/third_party/ffmpeg-win-build/
