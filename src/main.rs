@@ -44,19 +44,43 @@ struct Cli {
     force_transcribe: bool,
 }
 
+/// Where to look for the ONNX model, in order: the `--model` value, then the
+/// system and per-user data dirs (used by the .deb install), then the crate's
+/// own default.
+fn resolve_model(cli_model: &Path) -> PathBuf {
+    if cli_model.is_dir() {
+        return cli_model.to_path_buf();
+    }
+    let mut candidates = Vec::new();
+    if let Ok(dir) = std::env::var("YT_TRANSCRIBE_MODEL") {
+        candidates.push(PathBuf::from(dir));
+    }
+    candidates.push(PathBuf::from("/usr/share/yt-transcribe/models/tdt"));
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join(".local/share/yt-transcribe/models/tdt"));
+    }
+    for c in candidates {
+        if c.is_dir() {
+            return c;
+        }
+    }
+    cli_model.to_path_buf()
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
+    let model = resolve_model(&cli.model);
     std::fs::create_dir_all(&cli.output)?;
 
     if Path::new(&cli.input).is_file() {
-        transcribe_local(Path::new(&cli.input), &cli)
+        transcribe_local(Path::new(&cli.input), &cli, &model)
     } else {
-        transcribe_youtube(&cli)
+        transcribe_youtube(&cli, &model)
     }
 }
 
 /// Local media file: decode from disk, then transcribe.
-fn transcribe_local(path: &Path, cli: &Cli) -> Result<(), Box<dyn Error>> {
+fn transcribe_local(path: &Path, cli: &Cli, model: &Path) -> Result<(), Box<dyn Error>> {
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -69,7 +93,7 @@ fn transcribe_local(path: &Path, cli: &Cli) -> Result<(), Box<dyn Error>> {
         pcm.len() as f64 / 2.0 / 16000.0
     );
 
-    let result = asr::transcribe_pcm16k(&pcm, &cli.model)?;
+    let result = asr::transcribe_pcm16k(&pcm, model)?;
     let cues: Vec<output::Cue> = result.tokens.iter().map(Into::into).collect();
 
     let srt_path = cli.output.join(format!("{stem}.srt"));
@@ -86,7 +110,7 @@ fn transcribe_local(path: &Path, cli: &Cli) -> Result<(), Box<dyn Error>> {
 }
 
 /// YouTube URL: captions first, else stream + transcribe.
-fn transcribe_youtube(cli: &Cli) -> Result<(), Box<dyn Error>> {
+fn transcribe_youtube(cli: &Cli, model: &Path) -> Result<(), Box<dyn Error>> {
     let video_id = ingest::innertube::video_id_from_url(&cli.input)
         .ok_or("could not read the video id from the URL")?;
     eprintln!("video: {video_id}");
@@ -146,7 +170,7 @@ fn transcribe_youtube(cli: &Cli) -> Result<(), Box<dyn Error>> {
         pcm.len() as f64 / 2.0 / 16000.0
     );
 
-    let result = asr::transcribe_pcm16k(&pcm, &cli.model)?;
+    let result = asr::transcribe_pcm16k(&pcm, model)?;
     let cues: Vec<output::Cue> = result.tokens.iter().map(Into::into).collect();
 
     let n = output::srt::write_srt(&cues, &srt_path)?;
