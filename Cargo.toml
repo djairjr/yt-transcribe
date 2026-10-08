@@ -1,0 +1,16 @@
+[package]
+name = "yt-transcribe"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Links our own statically built FFmpeg (third_party/ffmpeg-install) through
+# rusty_ffmpeg; the default `ffmpeg8` feature matches FFmpeg 8.1.x.
+rsmpeg = "0.18"
+# HTTP for ingestion (watch page, innertube, media ranges). rustls-tls avoids
+# a system OpenSSL dependency, keeping the binary self-contained.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+serde_json = "1"
+# ASR: NVIDIA Parakeet via ONNX Runtime.
+parakeet-rs = "0.3"
+clap = { version = "4", features = ["derive"] }
