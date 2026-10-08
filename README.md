@@ -106,8 +106,8 @@ The ONNX model lives in a directory holding:
 | `vocab.txt` | Token vocabulary. |
 
 Lookup order: `--model` value, then `$YT_TRANSCRIBE_MODEL`,
-`/usr/share/yt-transcribe/models/tdt`, `~/.local/share/yt-transcribe/models/tdt`,
-then `models/tdt`.
+`/usr/share/yt-transcribe/models/tdt` (the `yt-transcribe-model` package),
+`~/.local/share/yt-transcribe/models/tdt`, then `models/tdt`.
 
 ### Source layout
 
@@ -155,16 +155,28 @@ Run:
 ./target/release/yt-transcribe ./video.mp4 --output ./out
 ```
 
-### Debian package
+### Debian packages
+
+Two packages, split on purpose — the weights are ~670 MB and separately
+licensed, so someone who only wants the binary should not have to pull them:
 
 ```bash
-bash packaging/build-deb.sh          # produces yt-transcribe_<ver>_amd64.deb
-sudo dpkg -i yt-transcribe_<ver>_amd64.deb
+bash packaging/build-deb.sh          # yt-transcribe_<ver>_amd64.deb        (~10 MB)
+bash packaging/build-deb-model.sh    # yt-transcribe-model_<ver>_all.deb    (~452 MB)
+
+sudo dpkg -i yt-transcribe_0.1.0_amd64.deb
+sudo dpkg -i yt-transcribe-model_0.1.0_all.deb   # optional, needs the model
 ```
 
-The package installs the binary as `/usr/bin/yt-transcribe`. The model is not
-bundled (size and a separate model license); fetch it with
-`scripts/fetch-model.sh`.
+| Package | Contents | Installs to |
+|---------|----------|-------------|
+| `yt-transcribe` | the binary | `/usr/bin/yt-transcribe` |
+| `yt-transcribe-model` | Parakeet TDT 0.6B v3 ONNX (int8) + a README recording its source and CC-BY-4.0 license | `/usr/share/yt-transcribe/models/tdt/` |
+
+Because the model package lands exactly where the binary looks (see *Model
+directory* below), no `--model` or environment variable is needed: install both
+and run `yt-transcribe <url>`. Only the program package is required for the
+captions path (a video whose subtitles already exist needs no model).
 
 ### Windows (cross-compiled from Linux)
 
