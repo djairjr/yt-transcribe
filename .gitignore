@@ -15,3 +15,6 @@
 # Windows cross build (FFmpeg for mingw; see scripts/build-ffmpeg-win.sh).
 /third_party/ffmpeg-win-install/
 /third_party/ffmpeg-win-build/
+
+# Cross-build bundle (exe + dll + model), produced locally.
+/dist/

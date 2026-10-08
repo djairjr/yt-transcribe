@@ -16,8 +16,14 @@ JOBS="$(nproc)"
 CROSS=x86_64-w64-mingw32-
 command -v "${CROSS}gcc" >/dev/null || { echo "error: ${CROSS}gcc not found (install gcc-mingw-w64-x86-64)"; exit 1; }
 
-# FFmpeg wants an out-of-tree build directory for a second configuration.
+# FFmpeg wants an out-of-tree build directory for a second configuration, but
+# the in-tree Linux build left config.h/Makefile in the source. distclean that
+# first (the Linux .a set is already installed under ffmpeg-install/, so nothing
+# is lost).
+( cd "$SRC" && make distclean ) >/dev/null 2>&1 || true
+
 BUILD="$SRC/../ffmpeg-win-build"
+rm -rf "$BUILD"
 mkdir -p "$BUILD"
 cd "$BUILD"
 

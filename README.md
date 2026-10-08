@@ -166,6 +166,29 @@ The package installs the binary as `/usr/bin/yt-transcribe`. The model is not
 bundled (size and a separate model license); fetch it with
 `scripts/fetch-model.sh`.
 
+### Windows (cross-compiled from Linux)
+
+The build produces a 64-bit Windows executable from this Linux host.
+
+```bash
+rustup target add x86_64-pc-windows-gnu
+sudo apt install gcc-mingw-w64-x86-64
+
+bash scripts/build-ffmpeg-win.sh      # static FFmpeg + libs for mingw
+bash scripts/build-win.sh             # -> target/x86_64-pc-windows-gnu/release/yt-transcribe.exe
+```
+
+Two things differ from the Linux build:
+
+- **ONNX Runtime is dynamic.** `ort` ships a prebuilt runtime only for the MSVC
+  target, not for `x86_64-pc-windows-gnu`, so the Windows build uses ort's
+  `load-dynamic` mode: the runtime is loaded at run time and `onnxruntime.dll`
+  must sit next to the executable.
+- **FFmpeg is still static.** The mingw build of FFmpeg is linked into the
+  `.exe`.
+
+Drop next to `yt-transcribe.exe`: `onnxruntime.dll` and `models/tdt/`.
+
 ## Dependencies
 
 | Crate | Role |
