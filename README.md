@@ -20,6 +20,29 @@ out/talk.srt
 out/talk.txt
 ```
 
+## Download
+
+Prebuilt binaries are on the
+[releases page](https://github.com/djairjr/yt-transcribe/releases):
+
+| Asset | What it is |
+|-------|------------|
+| `yt-transcribe_<ver>_amd64.deb` | The program (Linux x86-64). Installs `/usr/bin/yt-transcribe`. ~10 MB |
+| `yt-transcribe-model_<ver>_all.deb` | Parakeet TDT 0.6B v3 ONNX weights (int8). Installs to `/usr/share/yt-transcribe/models/tdt/`. ~452 MB |
+| `yt-transcribe-win-x64.zip` | Windows build: `yt-transcribe.exe` + `onnxruntime.dll` |
+
+```bash
+sudo dpkg -i yt-transcribe_0.1.0_amd64.deb
+sudo dpkg -i yt-transcribe-model_0.1.0_all.deb   # only if you need ASR
+```
+
+The model package lands exactly where the binary looks (see *Model directory*
+below), so no `--model` flag or environment variable is needed. A video that
+already has subtitles needs only the program package — the captions path uses
+no model.
+
+To build from source instead, see *Building from source*.
+
 ## Purpose
 
 Getting a transcript out of a video is normally a stack of moving parts: a
@@ -126,9 +149,7 @@ src/
 └── output/                 .srt and .txt writers
 ```
 
-## Installation
-
-### Build from source
+## Building from source
 
 Prerequisites: a C toolchain, `nasm`/`yasm`, `clang` (bindgen), and Rust.
 
