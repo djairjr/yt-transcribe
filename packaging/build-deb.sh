@@ -28,6 +28,10 @@ install -Dm755 "$BIN" "$STAGE/usr/bin/yt-transcribe"
 # export, if any), which a system service running as root would not find.
 install -Dm644 packaging/yt-transcribe.service "$STAGE/usr/lib/systemd/user/yt-transcribe.service"
 install -Dm644 README.md "$STAGE/usr/share/doc/yt-transcribe/README.md"
+install -Dm644 LICENSE "$STAGE/usr/share/doc/yt-transcribe/LICENSE"
+# The Debian convention: the licenses of everything the package carries, including the
+# statically linked LGPL FFmpeg.
+install -Dm644 packaging/copyright "$STAGE/usr/share/doc/yt-transcribe/copyright"
 install -Dm644 scripts/fetch-model.sh "$STAGE/usr/share/doc/yt-transcribe/fetch-model.sh"
 
 mkdir -p "$STAGE/DEBIAN"

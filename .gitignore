@@ -10,8 +10,10 @@
 /test-data/
 /models/
 
-# Build output: the .deb is produced by packaging/build-deb.sh.
+# Build output: the .deb is produced by packaging/build-deb.sh, and the .sha256
+# is what a release publishes next to it.
 /*.deb
+/*.deb.sha256
 
 # Windows cross build (FFmpeg for mingw; see scripts/build-ffmpeg-win.sh).
 /third_party/ffmpeg-win-install/

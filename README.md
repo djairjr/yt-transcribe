@@ -27,9 +27,12 @@ Prebuilt binaries are on the
 
 | Asset | What it is |
 |-------|------------|
-| `yt-transcribe_<ver>_amd64.deb` | The program (Linux x86-64). Installs `/usr/bin/yt-transcribe`. ~10 MB |
-| `yt-transcribe-model_<ver>_all.deb` | Parakeet TDT 0.6B v3 ONNX weights (int8). Installs to `/usr/share/yt-transcribe/models/tdt/`. ~452 MB |
-| `yt-transcribe-win-x64.zip` | Windows build: `yt-transcribe.exe` + `onnxruntime.dll` |
+| `yt-transcribe_<ver>_amd64.deb` | The program and the user systemd unit (Linux x86-64). Installs `/usr/bin/yt-transcribe`. ~19 MB |
+| `yt-transcribe-model_<ver>_all.deb` | Parakeet TDT 0.6B v3 ONNX weights (int8). Installs to `/usr/share/yt-transcribe/models/tdt/`. ~432 MB |
+| `<package>.sha256` | The checksum of each of the two |
+
+The Windows build is not published as an asset; the recipe is under *Building from
+source*.
 
 ```bash
 sudo dpkg -i yt-transcribe_0.1.0_amd64.deb
@@ -334,6 +337,22 @@ demuxer catalogue with the network protocols (`http`, `https`, `tls`, `udp`) and
 encoders, muxers, filters and devices disabled, and no `--enable-gpl` — it stays LGPL-2.1-or-later.
 The full catalogue is what makes "point at a video and read it" hold for any container; the linker
 discards what is unused.
+
+## Credits
+
+Standing on these:
+
+| What | Whose | Terms |
+|------|-------|-------|
+| FFmpeg | the FFmpeg developers | LGPL-2.1-or-later — built from source with no `--enable-gpl`, linked statically. The terms and the relinking note are in `/usr/share/doc/yt-transcribe/copyright` |
+| Parakeet TDT 0.6B v3 | NVIDIA | CC-BY-4.0 (the weights; not this code) |
+| `parakeet-rs` | its authors | MIT or Apache-2.0 — the ONNX Runtime path |
+| `rsmpeg` / `rusty_ffmpeg` | their authors | MIT — the FFmpeg bindings |
+| `rmcp` | the modelcontextprotocol project | Apache-2.0 — the MCP server SDK |
+| `reqwest`, `tokio`, `axum`, `clap`, `serde` | their authors | MIT or Apache-2.0 |
+| The cookie-export method | the yt-dlp wiki, *Extractors* | the incognito-window procedure, and the file format this tool reads |
+
+The code here is MIT — see `LICENSE`.
 
 ## Notes and limitations
 
