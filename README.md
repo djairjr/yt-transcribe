@@ -1,6 +1,8 @@
 # yt-transcribe
 
-Speech to subtitles, in one self-contained binary.
+**Give an agent what a video says.** A YouTube URL, a local file, or any media
+URL in; a timed transcript out — from one self-contained binary, or from one MCP
+call.
 
 `yt-transcribe` takes **a YouTube URL, a local media file, or any http(s) media URL**
 (a direct file, or an HLS/DASH playlist) and writes the transcript as timed text:
@@ -62,21 +64,32 @@ To build from source instead, see *Building from source*.
 
 ## Purpose
 
-A model can read text; it cannot watch a video. This tool exists to close that gap — to hand a model
-the **textual content of a video**, with the times, so it can answer about what was said and point at
-*when*.
+**Context for an agent about a video.** A model can read text and cannot watch a video; this is how
+the words get to it.
 
-That is why the MCP server returns text rather than a path (a path would only send the caller on a
-second trip it may not be able to make), why every cue carries its time, and why the transcript lives
-in a registry that survives an interrupted run instead of being written once at the end.
+It was built to replace a chain. Getting a model to know what a video says used to take several
+programs — a downloader, a media decoder, a speech recognizer, and glue to carry the result between
+them — and then the transcript had to be handed over by hand. Now it is one call to the MCP server:
 
-Getting there is normally a stack of moving parts: a downloader, a separate media decoder, a separate
-ASR runtime, glue code between them. This project collapses that into one binary with one decode core,
-so the result is reproducible and portable: one executable, no external media toolchain to install,
-no inter-process piping of audio.
+    submit  →  status  →  result
 
-The video itself is never downloaded for the YouTube path — only the audio track is streamed and
-decoded on the fly.
+The agent names the video, and the answer comes back as text *with the times*, so what it says can be
+about the video: "at 0:01 he is in front of the elephants". The CLI gives a human the same thing from
+one command, `yt-transcribe "<url>"`.
+
+Three consequences follow from that purpose, and they are why the code looks the way it does:
+
+- **`result` returns text, not a path.** A path would send the agent on a second trip to the disk for
+  the very thing it needs in order to answer.
+- **Every cue carries its time**, so an answer can point at the video instead of talking about the
+  text in the abstract.
+- **The transcript lives in a registry** (`<name>.cues.jsonl`), written as the work happens, so an
+  interrupted run resumes instead of starting over.
+
+Underneath it is one binary with one decode core: FFmpeg is linked statically and the speech model
+runs in-process on ONNX Runtime, so there is no external media toolchain to install and no audio piped
+between processes. For the YouTube path the video is never downloaded — only the audio track is
+streamed and decoded on the fly.
 
 ## How it works
 
@@ -204,6 +217,26 @@ can keep alive, because a stdio server dies with the client that spawned it.
 | `status` | Progress, read from the record **on disk**: state, blocks done of total, cues recorded, length. Restarting the service loses nothing. |
 | `result` | The transcript as **timed text**, in one of the modes below. |
 | `cancel` | Stops a running transcription between ASR blocks, keeping every finished block. |
+
+The point of the server is the **sequence**. An agent asked what a video says — or about some part of
+it — makes three calls and answers:
+
+```
+submit   { "source": "https://www.youtube.com/watch?v=jNQXAC9IVRw" }
+      -> { "job": "jNQXAC9IVRw", "kind": "youtube", "state": "running", "resumed_from_chunk": 0, ... }
+
+status   { "document": "jNQXAC9IVRw" }
+      -> { "state": "finished", "cues_recorded": 6,
+           "record": { "output_kind": "captions", "language": "en", "seconds": 18.9, ... } }
+
+result   { "document": "jNQXAC9IVRw", "term": "elephant", "context": 1 }
+      -> { "matches": 1, "term": "elephant",
+           "cues": [ { "at": "0:01", "text": "All right, so here we are, in front of the elephants" },
+                     { "at": "0:05", "text": "the cool thing about these guys is that they have really..." } ] }
+```
+
+Those three answers are real output, trimmed — not an illustration. The times are what make the
+result something that can point at the video.
 
 `result` never returns a path: the agent needs the words to answer with, and a path would force a
 second trip to the disk that only the agent can make. It has three modes, all anchored in time —
