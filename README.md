@@ -2,9 +2,11 @@
 
 Speech to subtitles, in one self-contained binary.
 
-`yt-transcribe` takes **a YouTube URL or a local media file** and writes two
-files: `<id>.txt` (the plain transcript) and `<id>.srt` (the same text with
-timestamps).
+`yt-transcribe` takes **a YouTube URL, a local media file, or any http(s) media URL**
+(a direct file, or an HLS/DASH playlist) and writes the transcript as timed text:
+`<name>.cues.jsonl`, the source of truth; `<name>.srt`, the same text with
+timestamps; and `<name>.txt`, plain. A fourth file, `<name>.task.json`, records
+the job, which is what lets an interrupted run resume instead of restarting.
 
 It does not shell out to `yt-dlp`, does not need a JavaScript runtime, and does
 not need Python at run time. The media decoder (FFmpeg) is linked statically
@@ -18,6 +20,10 @@ dQw4w9WgXcQ.txt
 $ yt-transcribe ./talk.mp4 --output ./out
 out/talk.srt
 out/talk.txt
+
+$ yt-transcribe "https://example.com/stream.m3u8" --output ./out
+out/stream.srt
+out/stream.txt
 ```
 
 ## Download
@@ -35,8 +41,16 @@ The Windows build is not published as an asset; the recipe is under *Building fr
 source*.
 
 ```bash
-sudo dpkg -i yt-transcribe_0.1.0_amd64.deb
-sudo dpkg -i yt-transcribe-model_0.1.0_all.deb   # only if you need ASR
+sudo dpkg -i yt-transcribe_0.2.0_amd64.deb
+sudo dpkg -i yt-transcribe-model_0.2.0_all.deb   # only if you need ASR
+
+sha256sum -c yt-transcribe_0.2.0_amd64.deb.sha256   # optional, against the published checksum
+```
+
+The program package also installs the systemd **user** unit, so the MCP server is one command away:
+
+```bash
+systemctl --user enable --now yt-transcribe     # serves http://127.0.0.1:9730/mcp
 ```
 
 The model package lands exactly where the binary looks (see *Model directory*
@@ -210,6 +224,27 @@ mcp_servers:
     enabled: true
 ```
 
+The URL is what answers; `command`/`args` are the stdio fallback for when the service is down. To
+bring the service up:
+
+```bash
+systemctl --user enable --now yt-transcribe
+```
+
+A **user** service stops when your last session ends, so an agent that should reach it after you log
+out needs lingering:
+
+```bash
+loginctl enable-linger "$USER"
+```
+
+The service runs the *installed* binary — which is worth checking by the process rather than by the
+unit file, since the unit states the intent and the process states the fact:
+
+```bash
+readlink -f "/proc/$(systemctl --user show yt-transcribe -p MainPID --value)/exe"
+```
+
 ### Account cookies
 
 An anonymous YouTube session has a low request ceiling, and a long queue of videos starts failing
@@ -280,17 +315,23 @@ Two packages, split on purpose — the weights are ~670 MB and separately
 licensed, so someone who only wants the binary should not have to pull them:
 
 ```bash
-bash packaging/build-deb.sh          # yt-transcribe_<ver>_amd64.deb        (~10 MB)
-bash packaging/build-deb-model.sh    # yt-transcribe-model_<ver>_all.deb    (~452 MB)
+bash packaging/build-deb.sh          # yt-transcribe_<ver>_amd64.deb        (~19 MB)
+bash packaging/build-deb-model.sh    # yt-transcribe-model_<ver>_all.deb    (~432 MB)
 
-sudo dpkg -i yt-transcribe_0.1.0_amd64.deb
-sudo dpkg -i yt-transcribe-model_0.1.0_all.deb   # optional, needs the model
+sudo dpkg -i yt-transcribe_0.2.0_amd64.deb
+sudo dpkg -i yt-transcribe-model_0.2.0_all.deb   # optional, needs the model
+
+systemctl --user enable --now yt-transcribe      # the MCP server, on 127.0.0.1:9730
 ```
 
 | Package | Contents | Installs to |
 |---------|----------|-------------|
-| `yt-transcribe` | the binary + the user systemd unit | `/usr/bin/yt-transcribe`, `/usr/lib/systemd/user/yt-transcribe.service` |
-| `yt-transcribe-model` | Parakeet TDT 0.6B v3 ONNX (int8) + a README recording its source and CC-BY-4.0 license | `/usr/share/yt-transcribe/models/tdt/` |
+| `yt-transcribe` | the binary, the user systemd unit, and the docs below | `/usr/bin/yt-transcribe`, `/usr/lib/systemd/user/yt-transcribe.service`, `/usr/share/doc/yt-transcribe/` |
+| `yt-transcribe-model` | Parakeet TDT 0.6B v3 ONNX (int8), `vocab.txt`, and a README recording its source and CC-BY-4.0 license | `/usr/share/yt-transcribe/models/tdt/`, `/usr/share/doc/yt-transcribe-model/` |
+
+What the program package puts in `/usr/share/doc/yt-transcribe/`: this README, `LICENSE` (MIT, for the
+code), and `copyright` — the Debian machine-readable file naming the terms of everything the binary
+carries, including the statically linked LGPL FFmpeg.
 
 Because the model package lands exactly where the binary looks (see *Model
 directory* below), no `--model` or environment variable is needed: install both
