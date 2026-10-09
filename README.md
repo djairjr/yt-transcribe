@@ -62,14 +62,21 @@ To build from source instead, see *Building from source*.
 
 ## Purpose
 
-Getting a transcript out of a video is normally a stack of moving parts: a
-downloader, a separate media decoder, a separate ASR runtime, glue code between
-them. This project collapses that into one binary with one decode core, so the
-result is reproducible and portable: one executable, no external media
-toolchain to install, no inter-process piping of audio.
+A model can read text; it cannot watch a video. This tool exists to close that gap — to hand a model
+the **textual content of a video**, with the times, so it can answer about what was said and point at
+*when*.
 
-The video itself is never downloaded for the YouTube path — only the audio
-track is streamed and decoded on the fly.
+That is why the MCP server returns text rather than a path (a path would only send the caller on a
+second trip it may not be able to make), why every cue carries its time, and why the transcript lives
+in a registry that survives an interrupted run instead of being written once at the end.
+
+Getting there is normally a stack of moving parts: a downloader, a separate media decoder, a separate
+ASR runtime, glue code between them. This project collapses that into one binary with one decode core,
+so the result is reproducible and portable: one executable, no external media toolchain to install,
+no inter-process piping of audio.
+
+The video itself is never downloaded for the YouTube path — only the audio track is streamed and
+decoded on the fly.
 
 ## How it works
 
