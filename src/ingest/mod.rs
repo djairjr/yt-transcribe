@@ -5,7 +5,9 @@
 
 pub mod captions;
 pub mod clients;
+pub mod cookies;
 pub mod formats;
+pub mod http;
 pub mod innertube;
 pub mod stream;
 pub mod watch;

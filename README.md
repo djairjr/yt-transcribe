@@ -86,9 +86,11 @@ an `.m4a` whose `moov` atom sits at the end of the file decodes correctly
 
 ```
 yt-transcribe <INPUT> [OPTIONS]
+yt-transcribe mcp [--transport stdio|http] [--address 127.0.0.1:9730]
 
 Arguments:
-  <INPUT>   A YouTube URL, or a path to a local media file.
+  <INPUT>   A YouTube URL, an http(s) media URL (direct file or HLS/DASH
+            playlist), or a path to a local media file.
 
 Options:
   -l, --lang <LANG>       Preferred caption language; when omitted the video's
@@ -96,18 +98,29 @@ Options:
   -o, --output <DIR>      Output directory.                  [default: .]
   -m, --model <DIR>       Model directory.               [default: models/tdt]
       --force-transcribe  Ignore existing captions and always transcribe audio.
+      --cookies <FILE>    A Netscape `cookies.txt` with an account session.
+                          See *Account cookies* below.
+      --force             Transcribe from the first block again, ignoring what is
+                          already recorded.
   -h, --help              Print help.
   -V, --version           Print version.
 ```
 
 ### Output files
 
-Named after the video id (YouTube) or the file stem (local file).
+Named after the video id (YouTube) or the file stem (local file or URL).
 
 | File | Content |
 |------|---------|
-| `<name>.txt` | Plain transcript, one paragraph. |
-| `<name>.srt` | SubRip subtitles, one cue per sentence/line. |
+| `<name>.cues.jsonl` | **The source of truth**: one cue per line, with its time and the block that produced it. |
+| `<name>.srt` | SubRip subtitles, derived from the registry. |
+| `<name>.txt` | Plain transcript, derived from the registry. |
+| `<name>.task.json` | The job record: state, blocks done, cues, length, language. |
+
+`.srt` and `.txt` are **derived**: the registry is where a transcription lives, and it is also what
+makes a run resumable. It is appended to once per 240-second ASR block, and a block lands there only
+after being transcribed whole — so re-running a transcript continues from `max(block) + 1` instead of
+redoing the file, and a cancelled run keeps everything it finished.
 
 An `.srt` cue:
 
@@ -136,18 +149,82 @@ Lookup order: `--model` value, then `$YT_TRANSCRIBE_MODEL`,
 
 ```
 src/
-├── main.rs                 CLI and the two input paths
+├── main.rs                 CLI, the `mcp` subcommand, route dispatch
+├── run.rs                  one transcription, end to end (CLI and MCP share it)
+├── task.rs                 the job record on disk (<stem>.task.json)
+├── mcp.rs                  the MCP server (5 tools, stdio and HTTP)
 ├── ingest/                 YouTube ingestion (replaces yt-dlp)
 │   ├── watch.rs            watch page -> ytInitialPlayerResponse
 │   ├── innertube.rs        POST /youtubei/v1/player
 │   ├── clients.rs          innertube client table (visionos, ios, android_vr)
-│   ├── formats.rs          audio-only format selection
+│   ├── formats.rs          audio-only format selection, and why there is none
 │   ├── captions.rs         caption track fetch + timedtext XML parser
+│   ├── cookies.rs          a Netscape cookie file, scoped by host
+│   ├── http.rs             the one place the HTTP client is built (UA + cookies)
 │   └── stream.rs           HTTP Range GET
 ├── audio/pcm.rs            FFmpeg + AVIOContext -> PCM 16 kHz mono
-├── asr/mod.rs              Parakeet TDT 0.6B v3 (ONNX), chunked
-└── output/                 .srt and .txt writers
+├── asr/mod.rs              Parakeet TDT 0.6B v3 (ONNX), chunked, cancellable
+└── output/                 the cue registry, and the .srt/.txt derived from it
 ```
+
+## MCP server
+
+The same binary is the MCP server: `yt-transcribe mcp` speaks the protocol over stdio (the client
+spawns it), and `--transport http` serves on `http://127.0.0.1:9730/mcp` — the only mode **systemd**
+can keep alive, because a stdio server dies with the client that spawned it.
+
+| Tool | What it does |
+|------|--------------|
+| `echo` | Returns the text with the instant of the call: proof the server answered now, not a cached value. |
+| `submit` | Starts a video in the background and returns at once. A job already running is refused, and what was already transcribed is never redone. |
+| `status` | Progress, read from the record **on disk**: state, blocks done of total, cues recorded, length. Restarting the service loses nothing. |
+| `result` | The transcript as **timed text**, in one of the modes below. |
+| `cancel` | Stops a running transcription between ASR blocks, keeping every finished block. |
+
+`result` never returns a path: the agent needs the words to answer with, and a path would force a
+second trip to the disk that only the agent can make. It has three modes, all anchored in time —
+a 35-minute video is tens of thousands of characters, and returning all of it would burn the context:
+
+| `result` arguments | Returns |
+|---|---|
+| *(none)* | A summary: cues, length, source (`captions`/`asr`), language when known, first and last cue with their times. Under 1 KB. |
+| `term`, `context` | The cues containing the term, each with its time, plus `context` neighbours each side — the neighbours are what make a hit quotable. |
+| `from`, `to` | Only the cues in that window, each with `start`, `end` and `at`. |
+| `full: true` | The whole text. |
+
+Every cue carries `at` (`12:34`), because the time is exactly what lets an answer point at the video
+instead of talking about the text in the abstract.
+
+To register it with Hermes, add it as a hybrid entry — HTTP first, stdio as the fallback when the
+service is down:
+
+```yaml
+mcp_servers:
+  yt-transcribe:
+    url: http://127.0.0.1:9730/mcp
+    command: /usr/bin/yt-transcribe
+    args: [mcp]
+    enabled: true
+```
+
+### Account cookies
+
+An anonymous YouTube session has a low request ceiling, and a long queue of videos starts failing
+partway through it; the account session raises that ceiling. Cookies are also how content that
+requires a login is reached — **except** age-restricted video, which needs more than cookies (see
+*Notes and limitations*).
+
+```bash
+yt-transcribe <url> --cookies ~/.config/yt-transcribe/cookies.txt
+```
+
+The file is the **Netscape** format that yt-dlp and the browser extensions write. Export it from an
+**incognito window** (log in, open `robots.txt` in that same tab, export, close the window), because
+YouTube rotates account cookies on open tabs and a normal-session export stops working. Only the
+cookies whose domain matches the host being talked to are ever sent, so a file exported from YouTube
+cannot leak to an unrelated media server, and no cookie value is ever logged.
+
+The export ages: when a request stops authenticating, export again.
 
 ## Building from source
 
@@ -191,7 +268,7 @@ sudo dpkg -i yt-transcribe-model_0.1.0_all.deb   # optional, needs the model
 
 | Package | Contents | Installs to |
 |---------|----------|-------------|
-| `yt-transcribe` | the binary | `/usr/bin/yt-transcribe` |
+| `yt-transcribe` | the binary + the user systemd unit | `/usr/bin/yt-transcribe`, `/usr/lib/systemd/user/yt-transcribe.service` |
 | `yt-transcribe-model` | Parakeet TDT 0.6B v3 ONNX (int8) + a README recording its source and CC-BY-4.0 license | `/usr/share/yt-transcribe/models/tdt/` |
 
 Because the model package lands exactly where the binary looks (see *Model
@@ -231,11 +308,14 @@ Drop next to `yt-transcribe.exe`: `onnxruntime.dll` and `models/tdt/`.
 | `serde_json` | Parsing player/innertube JSON. |
 | `parakeet-rs` | Parakeet models on ONNX Runtime. |
 | `clap` | CLI. |
+| `rmcp` 3.5 | The MCP server, over stdio and Streamable HTTP. |
+| `tokio`, `axum` | The async runtime, and the HTTP host for the MCP service. |
 
-FFmpeg 8.1.3 is built from source by `scripts/build-ffmpeg.sh`: static, PIC,
-audio-only decoders (AAC, Opus, Vorbis, FLAC, MP3), demuxers (mov, matroska,
-ogg, wav, mp3), with `--disable-everything` and no `--enable-gpl` (stays
-LGPL-2.1-or-later).
+FFmpeg 8.1.3 is built from source by `scripts/build-ffmpeg.sh`: static, PIC, the **full** decoder and
+demuxer catalogue with the network protocols (`http`, `https`, `tls`, `udp`) and OpenSSL, with
+encoders, muxers, filters and devices disabled, and no `--enable-gpl` — it stays LGPL-2.1-or-later.
+The full catalogue is what makes "point at a video and read it" hold for any container; the linker
+discards what is unused.
 
 ## Notes and limitations
 
@@ -250,3 +330,13 @@ LGPL-2.1-or-later).
   degrades. Music is not speech and transcribes poorly.
 - **Model license.** The Parakeet weights are CC-BY-4.0 (NVIDIA). The code
   here is not the model.
+- **Age-restricted video needs more than cookies.** Measured against a signed-in account: the
+  browser plays it and the API does not, even with valid cookies and across every innertube client
+  tried. `yt-dlp` with the same cookies fails the same way, and its log names what is missing — a
+  JavaScript runtime for the `n`/signature challenges, and a GVS PO token. Both are outside this
+  build's design (no JS solver, self-contained), so age-restricted content is **out of scope** and
+  reported as such rather than silently attempted.
+- **`.avi` served over HTTP does not decode.** The same file decodes whole from disk (measured: 95
+  minutes, 5690 s, no error). What fails is FFmpeg 8.1's HTTP layer: the demuxer asks for
+  `Range: bytes=<size>-`, the server answers `416` (correct per RFC 7233), and the request is
+  dropped; the system FFmpeg 9.0.1 reads the same URL from the same server without a word.

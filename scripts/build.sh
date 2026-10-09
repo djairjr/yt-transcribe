@@ -9,8 +9,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export FFMPEG_INCLUDE_DIR="$ROOT/third_party/ffmpeg-install/include"
-export FFMPEG_LIBS_DIR="$ROOT/third_party/ffmpeg-install/lib"
+export FFMPEG_INCLUDE_DIR="$ROOT/third_party/ffmpeg-install-net/include"
+export FFMPEG_LIBS_DIR="$ROOT/third_party/ffmpeg-install-net/lib"
 # Use a prebuilt binding instead of bindgen-in-build.rs: the generated one came
 # out with AVFormatContext opaque (missing its fields), while the crate's own
 # shipped binding (same bindgen 0.71.1) has them. See notes in the plan.

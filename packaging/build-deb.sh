@@ -9,7 +9,9 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-ARCH=amd64
+# Read from the system, never typed by hand: a package labelled amd64 holding an arm64 binary is
+# worse than no package at all.
+ARCH=$(dpkg --print-architecture)
 PKG="yt-transcribe_${VERSION}_${ARCH}"
 BIN=target/release/yt-transcribe
 
@@ -22,6 +24,9 @@ STAGE=$(mktemp -d "${TMPDIR:-/tmp}/yt-transcribe-deb.XXXXXX")
 trap 'rm -rf "$STAGE"' EXIT
 
 install -Dm755 "$BIN" "$STAGE/usr/bin/yt-transcribe"
+# The user unit, not a system one: the service reads the user's data directory (and their cookie
+# export, if any), which a system service running as root would not find.
+install -Dm644 packaging/yt-transcribe.service "$STAGE/usr/lib/systemd/user/yt-transcribe.service"
 install -Dm644 README.md "$STAGE/usr/share/doc/yt-transcribe/README.md"
 install -Dm644 scripts/fetch-model.sh "$STAGE/usr/share/doc/yt-transcribe/fetch-model.sh"
 

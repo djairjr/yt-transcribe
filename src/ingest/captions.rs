@@ -2,6 +2,7 @@
 //! never transcribe what YouTube already transcribed.
 
 use crate::ingest::clients;
+use crate::ingest::cookies::Jar;
 use crate::ingest::innertube;
 use crate::output::Cue;
 use serde_json::Value;
@@ -25,10 +26,11 @@ pub fn fetch(
     api_key: &str,
     visitor_data: Option<&str>,
     prefer: Option<&str>,
-) -> Result<Option<(String, Vec<Cue>)>, Box<dyn Error>> {
+    cookies: Option<&Jar>,
+) -> Result<Option<(String, Vec<Cue>, Option<String>)>, Box<dyn Error>> {
     // The iOS client is the one that actually hands out a working caption URL.
     let client = clients::ios();
-    let pr = innertube::player(&client, api_key, video_id, visitor_data)?;
+    let pr = innertube::player(&client, api_key, video_id, visitor_data, cookies)?;
     let Some(tracks) = tracks(&pr) else {
         return Ok(None);
     };
@@ -37,9 +39,7 @@ pub fn fetch(
     }
 
     let chosen = pick(&tracks, prefer, default_language(&pr).as_deref());
-    let xml = reqwest::blocking::Client::builder()
-        .user_agent(client.user_agent)
-        .build()?
+    let xml = crate::ingest::http::client_for(&chosen.url, Some(client.user_agent), cookies)?
         .get(&chosen.url)
         .send()?
         .error_for_status()?
@@ -58,7 +58,7 @@ pub fn fetch(
         .map(|c| c.text.as_str())
         .collect::<Vec<_>>()
         .join(" ");
-    Ok(Some((text, cues)))
+    Ok(Some((text, cues, Some(chosen.language.clone()))))
 }
 
 fn tracks(pr: &Value) -> Option<Vec<Track>> {
@@ -145,6 +145,8 @@ fn parse_transcript_xml(xml: &str) -> Result<Vec<Cue>, Box<dyn Error>> {
                 start,
                 end: start + dur,
                 text,
+                // A caption track is not an ASR block: the whole track is one unit.
+                chunk: 0,
             });
         }
     }

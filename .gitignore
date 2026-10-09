@@ -1,9 +1,10 @@
 /target
 
 # Vendored FFmpeg: the clone (~630 MB) and the built static libs are
-# reproducible from scripts/build-ffmpeg.sh -- never versioned.
+# reproducible from scripts/build-ffmpeg.sh -- never versioned. The glob covers
+# every install prefix (ffmpeg-install, ffmpeg-install-net, ...).
 /third_party/ffmpeg/
-/third_party/ffmpeg-install/
+/third_party/ffmpeg-install*/
 
 # Test artifacts: downloaded media, ONNX models, generated transcripts.
 /test-data/

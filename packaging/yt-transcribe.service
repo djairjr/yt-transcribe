@@ -1,0 +1,30 @@
+[Unit]
+Description=yt-transcribe — MCP server (Streamable HTTP)
+After=network.target
+
+[Service]
+Type=simple
+# HTTP, not stdio: a stdio server dies with the client that spawned it, and systemd hands pipes to
+# nobody. This mode lives on its own and answers any harness that points at the address.
+ExecStart=/usr/bin/yt-transcribe mcp --transport http --address 127.0.0.1:9730
+Restart=on-failure
+RestartSec=2
+
+StandardOutput=journal
+StandardError=journal
+
+# Where the transcripts live: the cue registry and the `.srt`/`.txt` derived from it.
+Environment=YT_TRANSCRIBE_DIR=%h/.local/share/yt-transcribe
+# With an account cookie export, uncomment this line. The export is read-only, which is enough —
+# and it is what lets a long queue of videos finish without hitting YouTube's request ceiling.
+#Environment=YT_COOKIES=%h/.config/yt-transcribe/cookies.txt
+
+# Hardening: the service needs the user's data directory and the local network, nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/yt-transcribe
+
+[Install]
+WantedBy=default.target

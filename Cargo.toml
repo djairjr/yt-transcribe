@@ -14,3 +14,15 @@ serde_json = "1"
 # ASR: NVIDIA Parakeet via ONNX Runtime.
 parakeet-rs = "0.3"
 clap = { version = "4", features = ["derive"] }
+
+# --- MCP server (Fase 3) -----------------------------------------------------
+# `transport-io` is NOT optional: the `server` feature brings `transport-async-rw`, not
+# `transport-io`, and it is `transport-io` that owns `transport::stdio()`. Without it the import
+# exists but is "configured out" -- the error points at the `#[cfg]` inside the crate, never at the
+# feature.
+rmcp = { version = "3.5", features = ["server", "transport-io", "transport-streamable-http-server"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
+serde = { version = "1", features = ["derive"] }
+# To host rmcp's tower service in a real HTTP server: a stdio server dies with the client that
+# spawned it, so HTTP is the only mode systemd can keep alive.
+axum = "0.8"

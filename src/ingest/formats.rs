@@ -55,3 +55,44 @@ pub fn audio_formats(player_response: &Value) -> Vec<AudioFormat> {
     });
     out
 }
+
+/// Why no audio could be taken from a player response -- in the response's own
+/// words.
+///
+/// The player says *why* it refused, and swallowing that is how a day gets lost:
+/// an age gate reported as "no audio-only format with a direct URL was returned"
+/// sends the reader after the wrong cause entirely. Measured 2026-10-09 on an
+/// age-gated video -- the real answer was `LOGIN_REQUIRED -- Sign in to confirm
+/// your age`, and the tool said nothing of the sort.
+pub fn why_no_audio(player_response: &Value, formats: &[AudioFormat]) -> String {
+    let status = player_response
+        .pointer("/playabilityStatus/status")
+        .and_then(|v| v.as_str());
+    let reason = player_response
+        .pointer("/playabilityStatus/reason")
+        .and_then(|v| v.as_str());
+
+    match status {
+        // Refused before offering anything: the reason is right there.
+        Some(status) if status != "OK" => match reason {
+            Some(reason) => format!(
+                "YouTube refused the player request: {status} -- {reason}. \
+                 Content that needs an account (age-restricted, members-only, a private \
+                 playlist) needs an account cookie export: --cookies <file>"
+            ),
+            None => format!("YouTube refused the player request: {status}"),
+        },
+        // Answered, but every audio URL would have to be rebuilt first.
+        _ if !formats.is_empty() && formats.iter().all(|f| f.url.is_none()) => {
+            let ciphered = formats.iter().filter(|f| f.cipher.is_some()).count();
+            format!(
+                "no audio format carries a direct URL: {ciphered} of {} need their URL rebuilt \
+                 from a signature/`n` challenge, which needs a JavaScript runtime this build \
+                 does not embed",
+                formats.len()
+            )
+        }
+        _ if formats.is_empty() => "the player response carried no audio format at all".to_string(),
+        _ => "no audio-only format with a direct URL was returned".to_string(),
+    }
+}

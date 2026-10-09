@@ -1,24 +1,28 @@
 //! Compressed audio -> PCM 16 kHz mono s16, decoded by the statically linked
 //! FFmpeg.
 //!
-//! Two sources feed the very same decode core:
+//! Three sources feed the very same decode core:
 //!
-//! * a **remote** media URL -- bytes arrive through a custom `AVIOContext`
-//!   whose read callback pulls HTTP Range slices on demand;
-//! * a **local** file (.mp4, .m4a, .webm, ...) -- an `AVIOContext` over the
-//!   file handle.
+//! * a **network URL FFmpeg opens itself** -- direct media or an HLS/DASH
+//!   playlist, so the demuxer fetches every segment;
+//! * a **remote** media URL whose bytes arrive through a custom `AVIOContext`
+//!   whose read callback pulls HTTP Range slices on demand (the YouTube path,
+//!   where that Range behaviour is tuned and proven);
+//! * a **local** file (.mp4, .m4a, .webm, .mkv, .avi, ...) -- an `AVIOContext`
+//!   over the file handle.
 //!
-//! Either way the demuxer never opens a protocol itself, and the decode/resample
-//! path is shared.
+//! The decode/resample path is shared; only who opens the bytes differs.
 //!
 //! Seek matters: an mp4/m4a keeps its `moov` atom at the END of the file, so the
 //! mov demuxer always seeks to the end before reading a packet. The seek callback
 //! must therefore honour AVSEEK_SIZE and SEEK_END, not just forward offsets.
 
+use rsmpeg::avcodec::AVPacket;
 use rsmpeg::avformat::{AVFormatContextInput, AVIOContextContainer, AVIOContextCustom};
-use rsmpeg::avutil::AVMem;
+use rsmpeg::avutil::{AVDictionary, AVMem};
 use rsmpeg::ffi;
 use std::error::Error;
+use std::ffi::CString;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -88,8 +92,7 @@ pub fn decode_file_to_pcm16k(
                 Ok(s) => s,
                 Err(_) => return -1,
             };
-            let size = st.size;
-            seek_target(&mut st.read, size, offset, whence)
+            st.seek(offset, whence)
         });
 
     let io = AVIOContextCustom::alloc_context(
@@ -110,14 +113,18 @@ pub fn decode_file_to_pcm16k(
 /// required because the mov demuxer seeks to the end of the file, and a seek
 /// needs the size. A HEAD request is used if it is 0.
 ///
+/// `cookies`, when given, ride every Range request as a `Cookie` header: an age-
+/// or account-gated stream is what needs them on this path.
+///
 /// `cap_samples` stops early once that many 16k samples were produced.
 pub fn decode_to_pcm16k(
     url: &str,
     size: u64,
+    cookies: Option<&crate::ingest::cookies::Jar>,
     cap_samples: Option<usize>,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
     debug_log();
-    let client = reqwest::blocking::Client::builder().build()?;
+    let client = crate::ingest::http::client_for(url, None, cookies)?;
     let size = if size > 0 {
         size
     } else {
@@ -175,8 +182,7 @@ pub fn decode_to_pcm16k(
                 Ok(s) => s,
                 Err(_) => return -1,
             };
-            let size = st.size;
-            seek_target(&mut st.read, size, offset, whence)
+            st.seek(offset, whence)
         });
 
     let io = AVIOContextCustom::alloc_context(
@@ -191,12 +197,61 @@ pub fn decode_to_pcm16k(
     decode_input(&mut input, cap_samples)
 }
 
+/// Decode a **network URL that FFmpeg opens itself**: a direct media file or a
+/// playlist (`hls`, `dash`, `mpegts`), over `http`/`https`.
+///
+/// This is the third door into [`decode_input`]. Where [`decode_to_pcm16k`]
+/// keeps its own AVIO over `reqwest` -- the googlevideo Range behaviour is tuned
+/// there and proven -- here FFmpeg owns the connection, which is the whole
+/// point: a playlist demuxer has to fetch each segment itself, and no
+/// hand-rolled AVIO can do that.
+///
+/// `user_agent` and `headers` go out as protocol AVOptions; `headers` takes the
+/// `\r\n`-separated form FFmpeg expects.
+pub fn decode_url_to_pcm16k(
+    url: &str,
+    user_agent: Option<&str>,
+    headers: Option<&str>,
+    cap_samples: Option<usize>,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    debug_log();
+
+    let url_c = CString::new(url)?;
+    let mut opts: Option<AVDictionary> = None;
+    if let Some(ua) = user_agent {
+        let v = CString::new(ua)?;
+        opts = Some(AVDictionary::new(c"user_agent", &v, 0));
+    }
+    if let Some(h) = headers {
+        let v = CString::new(h)?;
+        opts = Some(match opts {
+            Some(dict) => dict.set(c"headers", &v, 0),
+            None => AVDictionary::new(c"headers", &v, 0),
+        });
+    }
+
+    let mut input = AVFormatContextInput::builder()
+        .url(url_c.as_c_str())
+        .options(&mut opts)
+        .open()?;
+    decode_input(&mut input, cap_samples)
+}
+
 struct HttpState {
     client: reqwest::blocking::Client,
     url: String,
     read: u64,
     size: u64,
     eof: bool,
+}
+
+impl HttpState {
+    /// Move the read cursor. See [`seek_target`] for why EOF is cleared here:
+    /// inside a method the two field borrows are disjoint, which they are not at
+    /// the call site.
+    fn seek(&mut self, offset: i64, whence: i32) -> i64 {
+        seek_target(&mut self.read, &mut self.eof, self.size, offset, whence)
+    }
 }
 
 struct FileState {
@@ -206,8 +261,21 @@ struct FileState {
     eof: bool,
 }
 
+impl FileState {
+    /// Move the read cursor. See [`HttpState::seek`].
+    fn seek(&mut self, offset: i64, whence: i32) -> i64 {
+        seek_target(&mut self.read, &mut self.eof, self.size, offset, whence)
+    }
+}
+
 /// Shared seek policy for both sources.
-fn seek_target(read: &mut u64, size: u64, offset: i64, whence: i32) -> i64 {
+///
+/// A successful seek **clears** the EOF flag. Without that, reaching the end of the
+/// file once is permanent: the avi demuxer reads through to the end while opening a
+/// file that carries no index, and every read after that would return AVERROR_EOF --
+/// `read_packet` yields nothing and the file looks empty. Measured on an index-less
+/// AVI: 0.0 s decoded before this line, the full 120 s after.
+fn seek_target(read: &mut u64, eof: &mut bool, size: u64, offset: i64, whence: i32) -> i64 {
     if whence as u32 == ffi::AVSEEK_SIZE {
         return size as i64;
     }
@@ -225,6 +293,7 @@ fn seek_target(read: &mut u64, size: u64, offset: i64, whence: i32) -> i64 {
         return -1;
     }
     *read = target as u64;
+    *eof = false;
     target
 }
 
@@ -267,6 +336,7 @@ fn decode_input(
 
     let mut pcm: Vec<u8> = Vec::new();
     let cap_bytes = cap_samples.map(|s| s * 2);
+    let mut rejected = 0usize;
 
     while let Some(packet) = input.read_packet()? {
         // read_packet() returns packets from every stream; the video packets of
@@ -275,8 +345,16 @@ fn decode_input(
         if pkt_stream != stream_index as i32 {
             continue;
         }
-        codec_ctx.send_packet(Some(&packet))?;
-        drain_frames(&mut codec_ctx, &swr, &mut pcm, cap_bytes)?;
+
+        decode_packet(
+            &mut codec_ctx,
+            &swr,
+            &mut pcm,
+            cap_bytes,
+            &packet,
+            &mut rejected,
+        )?;
+
         drop(packet);
         if cap_bytes.map_or(false, |c| pcm.len() >= c) {
             break;
@@ -285,10 +363,39 @@ fn decode_input(
     let _ = codec_ctx.send_packet(None);
     let _ = drain_frames(&mut codec_ctx, &swr, &mut pcm, cap_bytes);
 
+    if rejected > 0 {
+        eprintln!("decode: {rejected} packet(s) rejected by the decoder and skipped");
+    }
     if let Some(c) = cap_bytes {
         pcm.truncate(c);
     }
     Ok(pcm)
+}
+
+/// Feed one packet to the decoder and pull out everything it yields.
+///
+/// A rejected packet is counted and skipped, never fatal: real files carry
+/// damaged frames, and FFmpeg's own CLI discards such a packet and keeps going.
+/// Aborting instead throws away every minute already decoded.
+fn decode_packet(
+    codec_ctx: &mut rsmpeg::avcodec::AVCodecContext,
+    swr: &rsmpeg::swresample::SwrContext,
+    pcm: &mut Vec<u8>,
+    cap_bytes: Option<usize>,
+    packet: &AVPacket,
+    rejected: &mut usize,
+) -> Result<(), Box<dyn Error>> {
+    if let Err(e) = codec_ctx.send_packet(Some(packet)) {
+        *rejected += 1;
+        if *rejected <= 5 {
+            eprintln!(
+                "decode: packet rejected at ~{:.1} s of audio ({e})",
+                pcm.len() as f64 / 2.0 / PCM_SAMPLE_RATE as f64
+            );
+        }
+        return Ok(());
+    }
+    drain_frames(codec_ctx, swr, pcm, cap_bytes)
 }
 
 /// Pull every available frame out of the decoder and resample it into `pcm`.

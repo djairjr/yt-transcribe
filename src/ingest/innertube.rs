@@ -2,6 +2,7 @@
 //! back the streamingData (adaptiveFormats included).
 
 use crate::ingest::clients::Client;
+use crate::ingest::cookies::Jar;
 use serde_json::{json, Value};
 use std::error::Error;
 
@@ -11,11 +12,14 @@ const PLAYER_ENDPOINT: &str = "https://www.youtube.com/youtubei/v1/player";
 ///
 /// `visitor_data` goes out as `X-Goog-Visitor-Id`: without it YouTube treats
 /// the request as a fresh anonymous session and tends to answer LOGIN_REQUIRED.
+/// `cookies`, when given, are what actually authenticate an account session --
+/// the visitor id alone never does.
 pub fn player(
     client: &Client,
     api_key: &str,
     video_id: &str,
     visitor_data: Option<&str>,
+    cookies: Option<&Jar>,
 ) -> Result<Value, Box<dyn Error>> {
     let body = json!({
         "context": {
@@ -26,9 +30,7 @@ pub fn player(
         "racyCheckOk": true,
     });
 
-    let http = reqwest::blocking::Client::builder()
-        .user_agent(client.user_agent)
-        .build()?;
+    let http = crate::ingest::http::client_for(PLAYER_ENDPOINT, Some(client.user_agent), cookies)?;
 
     let mut req = http
         .post(PLAYER_ENDPOINT)

@@ -1,6 +1,7 @@
 //! Watch page: GET the HTML and pull out the embedded `ytInitialPlayerResponse`
 //! JSON plus the innertube bootstrap values (API key / visitor data).
 
+use crate::ingest::cookies::Jar;
 use serde_json::Value;
 use std::error::Error;
 
@@ -10,8 +11,8 @@ const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
                   (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 
 /// GET the watch page and return its HTML.
-pub fn fetch_watch(url: &str) -> Result<String, Box<dyn Error>> {
-    let client = reqwest::blocking::Client::builder().user_agent(UA).build()?;
+pub fn fetch_watch(url: &str, cookies: Option<&Jar>) -> Result<String, Box<dyn Error>> {
+    let client = crate::ingest::http::client_for(url, Some(UA), cookies)?;
     let html = client.get(url).send()?.error_for_status()?.text()?;
     Ok(html)
 }
@@ -23,8 +24,8 @@ pub struct WatchPage {
     pub visitor_data: Option<String>,
 }
 
-pub fn watch_page(url: &str) -> Result<WatchPage, Box<dyn Error>> {
-    let html = fetch_watch(url)?;
+pub fn watch_page(url: &str, cookies: Option<&Jar>) -> Result<WatchPage, Box<dyn Error>> {
+    let html = fetch_watch(url, cookies)?;
     let api_key = quoted_after(&html, "INNERTUBE_API_KEY")
         .ok_or("INNERTUBE_API_KEY not found in watch page")?;
     let visitor_data = quoted_after(&html, "VISITOR_DATA");
@@ -110,8 +111,8 @@ fn balanced_object(s: &str) -> Option<String> {
 }
 
 /// Fetch the watch page and parse `ytInitialPlayerResponse` into JSON.
-pub fn player_response(url: &str) -> Result<Value, Box<dyn Error>> {
-    let html = fetch_watch(url)?;
+pub fn player_response(url: &str, cookies: Option<&Jar>) -> Result<Value, Box<dyn Error>> {
+    let html = fetch_watch(url, cookies)?;
     player_response_from_html(&html)
 }
 
