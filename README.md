@@ -253,6 +253,24 @@ Run:
 ./target/release/yt-transcribe ./video.mp4 --output ./out
 ```
 
+### Tests
+
+```bash
+# The HTTP server the network route is tested against: it honours Range, and
+# `python3 -m http.server` does not.
+python3 scripts/test/http_range_server.py 8090 /path/to/media
+
+# The MCP surface, under a real client (needs the `mcp` package, >= 1.27).
+python3 tests/tier2_test.py
+
+# Cancel, resume, and the state surviving the process: needs media with several
+# 240-second blocks.
+python3 tests/cancel_resume_test.py /path/to/long-media.avi
+```
+
+`cargo test` covers the cookie file: the host scoping, the expiry rule, the look-alike host, and
+both prefix conventions.
+
 ### Debian packages
 
 Two packages, split on purpose — the weights are ~670 MB and separately
