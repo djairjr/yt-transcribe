@@ -50,7 +50,7 @@ Section: sound
 Priority: optional
 Architecture: ${ARCH}
 Installed-Size: ${SIZE}
-Maintainer: Lesords <lesords168@gmail.com>
+Maintainer: Djair Guilherme da Silva Junior <djair.jr@gmail.com>
 Recommends: yt-transcribe
 Description: Parakeet TDT 0.6B v3 ONNX weights for yt-transcribe
  The NVIDIA Parakeet TDT 0.6B v3 speech model in ONNX (int8) form, installed

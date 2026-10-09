@@ -34,7 +34,7 @@ Section: utils
 Priority: optional
 Architecture: ${ARCH}
 Installed-Size: ${SIZE}
-Maintainer: Lesords <lesords168@gmail.com>
+Maintainer: Djair Guilherme da Silva Junior <djair.jr@gmail.com>
 Description: Speech-to-subtitles from a YouTube URL or a local media file
  Turns a YouTube URL or a local media file into <id>.txt and <id>.srt.
  The media decoder (FFmpeg) is linked statically and the speech model runs
