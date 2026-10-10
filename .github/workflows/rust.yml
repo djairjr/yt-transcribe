@@ -21,6 +21,16 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The runner's static libxml2 references lzma and ICU, and its pkg-config does not declare them
+  # (this machine's libxml2 asks for neither: `-lxml2 -lm -lz`), so the linker never receives
+  # `-llzma -licuuc` and the link dies with `undefined symbol: lzma_code`, `ucnv_open_74`, ...
+  #
+  # They are handed to the link HERE instead of being added to build-ffmpeg.sh, on purpose: doing it
+  # in the recipe would make the PUBLISHED binary embed ICU statically (~30 MB of libicudata) to
+  # satisfy a quirk of this runner. CI never publishes a binary — it proves the recipe, the code and
+  # the tests — and the release build happens on the machine where the dependency is already
+  # declared. The difference is stated here rather than hidden.
+  RUSTFLAGS: "-C link-arg=-llzma -C link-arg=-licuuc -C link-arg=-licudata"
 
 jobs:
   build:
