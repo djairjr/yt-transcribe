@@ -57,20 +57,32 @@ pub fn transcribe(
     // What the previous run produced, and of what kind. Read before anything else, because a
     // caption registry is not a partial transcript.
     let prior = task::read(opts.dir, &stem)?;
-    let captions_done = prior.as_ref().is_some_and(|t| t.output_kind == "captions")
-        && registry::read(&cues_path)?.len() > 0;
+    let prior_captions = prior.as_ref().is_some_and(|t| t.output_kind == "captions");
+    let prior_finished = prior.as_ref().is_some_and(|t| t.state == "finished");
 
-    if opts.force || (opts.force_transcribe && captions_done) {
-        // `--force` starts over. `--force-transcribe` over a caption registry does the same, and
-        // that is deliberate: captions and ASR text are two different products, and appending one
-        // to the other is the mixed transcript measured on 2026-10-10.
+    // The registry starts empty when the run is meant to redo the work: `--force` ("again, ignoring
+    // what is recorded"), `--force-transcribe` over captions ("ignore them and transcribe instead"),
+    // or a caption registry that was left `cancelled` or `failed` -- that one is not complete work,
+    // and refetching captions APPENDS, so it has to be cleared first. Measured 2026-10-10: with the
+    // reset after the flag was computed, `--force` answered "already transcribed" and never redid
+    // anything, and a run after a Ctrl-C stayed `cancelled` forever.
+    let reset = opts.force
+        || (opts.force_transcribe && prior_captions)
+        || (prior_captions && !prior_finished);
+    if reset {
         let _ = std::fs::remove_file(&cues_path);
     }
+
     // The registry is the truth about what was already paid for.
     let recorded = registry::read(&cues_path)?;
-    // A caption registry is COMPLETE work: re-running the command must not "resume" it as if its
-    // chunk 0 were a first ASR block -- measured 2026-10-10, that logged "resuming at block 1",
-    // skipped the caption lookup and appended ASR from four minutes in.
+    // A FINISHED caption registry is complete work, not a first ASR block: re-running the command
+    // does nothing (measured 2026-10-10: it used to log "resuming at block 1", skip the caption
+    // lookup and append ASR from four minutes in, flipping the record's kind).
+    let captions_done = prior_captions
+        && prior_finished
+        && !recorded.is_empty()
+        && !opts.force
+        && !opts.force_transcribe;
     let resume = !opts.force && !recorded.is_empty() && !captions_done;
     let from_chunk = registry::last_chunk(&recorded).map(|c| c + 1).unwrap_or(0);
 
