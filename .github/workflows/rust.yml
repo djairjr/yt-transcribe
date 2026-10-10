@@ -31,15 +31,17 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install what FFmpeg and rsmpeg need
-        # libjitterentropy-dev, zlib1g-dev and libzstd-dev are not optional: FFmpeg's static build
-        # links OpenSSL, and OpenSSL's pkg-config pulls `-ljitterentropy -lz -lzstd` into the link
-        # line. Measured in the first CI run — the link failed with
-        # `unable to find library -ljitterentropy`, which is a CI-only discovery: the local machine
-        # happens to have those packages installed.
+        # The extra libraries are not optional: FFmpeg's static build links OpenSSL, and OpenSSL's
+        # pkg-config puts its private dependencies on the link line — measured here as
+        # `-lssl -lcrypto -l:libjitterentropy.a -lz -lzstd -ldl -pthread`. Without the jitterentropy
+        # development package the link dies with `unable to find library -ljitterentropy`, which is a
+        # CI-only discovery: this machine happens to have it installed. Its name is versioned on some
+        # releases, so both spellings are tried rather than guessed.
         run: |
           sudo apt-get update
           sudo apt-get install -y nasm yasm clang pkg-config libssl-dev libxml2-dev \
-                                  libjitterentropy-dev zlib1g-dev libzstd-dev
+                                  zlib1g-dev libzstd-dev
+          sudo apt-get install -y libjitterentropy3-dev || sudo apt-get install -y libjitterentropy-dev
 
       # The static FFmpeg is reproducible from the script and never versioned (it is ~630 MB of
       # clone plus the built libs). Cached on the script's own hash: change the configure line and
