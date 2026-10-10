@@ -20,6 +20,22 @@ if [ ! -x "$BIN" ]; then
     exit 1
 fi
 
+# Guard against the class of error that already happened in this family: a document inside the
+# artifact citing a version other than the one being built (the manual shipped 0.1.0 once, a README
+# pointed at an older package). Cargo.toml is the source of truth; a document that disagrees stops
+# the build. The pattern deliberately matches the PROGRAM package only -- the model package carries
+# the weights' own version, which is not the program's.
+grep -q "yt-transcribe_${VERSION}_" README.md || {
+    echo "error: README.md does not cite the package yt-transcribe_${VERSION}_ -- update it" >&2
+    exit 1
+}
+stale=$(grep -HoE "yt-transcribe_[0-9]+\.[0-9]+\.[0-9]+" README.md | grep -v "$VERSION" || true)
+if [ -n "$stale" ]; then
+    echo "error: README cites a version other than $VERSION:" >&2
+    echo "$stale" >&2
+    exit 1
+fi
+
 STAGE=$(mktemp -d "${TMPDIR:-/tmp}/yt-transcribe-deb.XXXXXX")
 trap 'rm -rf "$STAGE"' EXIT
 

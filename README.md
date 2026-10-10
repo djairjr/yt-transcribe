@@ -43,10 +43,11 @@ The Windows build is not published as an asset; the recipe is under *Building fr
 source*.
 
 ```bash
-sudo dpkg -i yt-transcribe_0.2.0_amd64.deb
-sudo dpkg -i yt-transcribe-model_0.2.0_all.deb   # only if you need ASR
+sudo dpkg -i yt-transcribe_0.2.1_amd64.deb
+sudo dpkg -i yt-transcribe-model_0.2.0_all.deb   # only if you need ASR. The model package
+                                                 # version tracks the weights, not the program.
 
-sha256sum -c yt-transcribe_0.2.0_amd64.deb.sha256   # optional, against the published checksum
+sha256sum -c yt-transcribe_0.2.1_amd64.deb.sha256   # optional, against the published checksum
 ```
 
 The program package also installs the systemd **user** unit, so the MCP server is one command away:
@@ -390,8 +391,9 @@ licensed, so someone who only wants the binary should not have to pull them:
 bash packaging/build-deb.sh          # yt-transcribe_<ver>_amd64.deb        (~19 MB)
 bash packaging/build-deb-model.sh    # yt-transcribe-model_<ver>_all.deb    (~432 MB)
 
-sudo dpkg -i yt-transcribe_0.2.0_amd64.deb
-sudo dpkg -i yt-transcribe-model_0.2.0_all.deb   # optional, needs the model
+sudo dpkg -i yt-transcribe_0.2.1_amd64.deb
+sudo dpkg -i yt-transcribe-model_0.2.0_all.deb   # optional, needs the model; its version tracks
+                                                 # the weights, not the program
 
 systemctl --user enable --now yt-transcribe      # the MCP server, on 127.0.0.1:9730
 ```
