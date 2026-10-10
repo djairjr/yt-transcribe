@@ -237,15 +237,75 @@ The ONNX model lives in a directory holding:
 | `nemo128.onnx` | NeMo mel preprocessor. |
 | `vocab.txt` | Token vocabulary. |
 
-Lookup order: `--model` value, then `$YT_TRANSCRIBE_MODEL`,
-`/usr/share/yt-transcribe/models/tdt` (the `yt-transcribe-model` package),
+Lookup order: `--model` value, then `$YT_TRANSCRIBE_MODEL`, then the `model` key of the
+configuration file, `/usr/share/yt-transcribe/models/tdt` (the `yt-transcribe-model` package),
 `~/.local/share/yt-transcribe/models/tdt`, then `models/tdt`.
+
+### Configuration file
+
+Optional. Nothing here is required: with no file anywhere the tool runs exactly as it did before
+the file existed, and every value below falls back to the one it always had.
+
+The file is JSON, and it is looked for in this order — the first one that exists wins:
+
+    --config <path>
+    $YT_TRANSCRIBE_CONFIG
+    $XDG_CONFIG_HOME/yt-transcribe/config.json   (~/.config/yt-transcribe/config.json)
+    /etc/yt-transcribe/config.json
+
+| Key | Type | Same as |
+|-----|------|---------|
+| `lang` | string | `--lang` |
+| `output` | string | `--output` |
+| `model` | string | `--model` |
+| `cookies` | string | `--cookies` |
+| `force_transcribe` | bool | `--force-transcribe` |
+| `force` | bool | `--force` |
+
+Every key is optional, and an unknown one is an **error** naming the file, the line and the
+column — a configuration that accepts garbage hides the typo that was made. `--config <path>` that
+names a file which is not there is an error too; a file nobody asked for is not.
+
+Precedence, first that exists wins: **flag > environment > file > built-in default**. The server
+walks the same chain, with the caller's own arguments in the place of the flags, so `submit` and
+the command line can never disagree about where a transcript lands on the same machine.
+
+```json
+{
+  "lang": "pt",
+  "output": "~/.local/share/yt-transcribe",
+  "model": "/usr/share/yt-transcribe/models/tdt",
+  "cookies": "~/.config/yt-transcribe/cookies.txt",
+  "force_transcribe": false,
+  "force": false
+}
+```
+
+Ask what the program really read, and which step decided each value:
+
+```console
+$ yt-transcribe config show
+file       /home/you/.config/yt-transcribe/config.json
+looked in:
+             /home/you/.config/yt-transcribe/config.json
+             /etc/yt-transcribe/config.json
+lang      pt  (config file)
+output    out  (flag)
+model     /usr/share/yt-transcribe/models/tdt  (default)
+cookies   none  (default)
+force_transcribe false  (default)
+force     false  (default)
+```
+
+The `.deb` installs `config.example.json` under `/usr/share/doc/yt-transcribe/` — an example to
+copy, never a configuration that is already in force.
 
 ### Source layout
 
 ```
 src/
 ├── main.rs                 CLI, the `mcp` subcommand, route dispatch
+├── config.rs               the optional configuration file: the search chain, the keys, the steps
 ├── run.rs                  one transcription, end to end (CLI and MCP share it)
 ├── task.rs                 the job record on disk (<stem>.task.json)
 ├── mcp.rs                  the MCP server (5 tools, stdio and HTTP)

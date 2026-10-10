@@ -49,6 +49,9 @@ install -Dm644 LICENSE "$STAGE/usr/share/doc/yt-transcribe/LICENSE"
 # statically linked LGPL FFmpeg.
 install -Dm644 packaging/copyright "$STAGE/usr/share/doc/yt-transcribe/copyright"
 install -Dm644 scripts/fetch-model.sh "$STAGE/usr/share/doc/yt-transcribe/fetch-model.sh"
+# An EXAMPLE, never a configuration in force: the .deb installs nothing under ~/.config or /etc, so
+# the file the user's runs read is always one the user wrote.
+install -Dm644 packaging/config.example.json "$STAGE/usr/share/doc/yt-transcribe/config.example.json"
 
 mkdir -p "$STAGE/DEBIAN"
 SIZE=$(du -sk "$STAGE/usr" | cut -f1)

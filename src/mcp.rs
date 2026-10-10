@@ -30,10 +30,12 @@
 //! conversation with the client. Everything here — diagnostics, warnings, errors — goes to
 //! **stderr**.
 
+use crate::config;
 use crate::ingest::cookies::Jar;
 use crate::output::{Cue, cues as registry, srt};
 use crate::run::{self, Options};
 use crate::task;
+use crate::{Effective, World};
 use rmcp::{
     ErrorData as McpError, ServiceExt,
     handler::server::wrapper::Parameters,
@@ -42,7 +44,7 @@ use rmcp::{
     transport::stdio,
 };
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -160,50 +162,56 @@ impl Jobs {
 #[derive(Clone)]
 pub struct Server {
     jobs: Arc<Jobs>,
+    /// What the process read from outside itself, read once: the server walks the same
+    /// configuration chain the command line does.
+    world: Arc<World>,
+    /// The configuration file in force, read once at start.
+    file: Arc<config::Config>,
 }
 
 impl Server {
     pub fn new() -> Self {
+        let world = World::real();
+        // A file the server cannot read is reported and then ignored: the server exists to answer,
+        // and every key is optional -- there is no configuration it could not do without. The
+        // command line is stricter, because there a person is waiting on the answer.
+        let file = match crate::load_config(None, &world) {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("yt-transcribe mcp: ignoring the configuration: {e}");
+                config::Config::default()
+            }
+        };
+        eprintln!(
+            "yt-transcribe mcp: model {}",
+            crate::resolve_model(&world, None, file.model.as_deref()).0.display()
+        );
         Self {
             jobs: Arc::new(Jobs::default()),
+            world: Arc::new(world),
+            file: Arc::new(file),
         }
     }
+
+    /// The chain, walked once per call, with the caller's arguments taking the place of the flags.
+    fn plan(&self, dir: Option<&str>, lang: Option<&str>, force: Option<bool>) -> Effective {
+        crate::effective_mcp(&self.world, &self.file, dir, lang, force)
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Where things live, resolved the same way everywhere
+// Where things live, resolved by the ONE chain in `main.rs`
 // ---------------------------------------------------------------------------
 
-/// Where transcripts are written when the caller does not say.
+/// Load the cookie file a call asked for, if any.
 ///
-/// The default is a per-user data directory, so the service can run under systemd (where there is
-/// no convenient working directory) and still leave the transcripts somewhere a person can find.
-fn default_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("YT_TRANSCRIBE_DIR") {
-        return PathBuf::from(dir);
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".local/share/yt-transcribe");
-    }
-    PathBuf::from(".")
-}
-
-/// The directory for this call: the caller's `dir` wins over the default.
-fn output_dir(dir: Option<String>) -> PathBuf {
-    match dir.map(|d| d.trim().to_string()).filter(|d| !d.is_empty()) {
-        Some(d) => PathBuf::from(d),
-        None => default_dir(),
-    }
-}
-
-/// The cookie file, when one is configured for the service.
-///
-/// A service has no command line, so the export is picked up from `YT_COOKIES`. The cookies are
-/// what lets a long queue of videos finish without hitting the request ceiling; they are optional,
-/// and an unreadable file is a warning, not a failure.
-fn cookies() -> Option<Jar> {
-    let path = std::env::var("YT_COOKIES").ok()?;
-    match Jar::load(Path::new(&path)) {
+/// A service has no command line, so the path arrives from the configuration chain
+/// (`$YT_COOKIES`, then the file's `cookies`). An unreadable file is a warning, not a failure: the
+/// cookies are what lets a long queue of videos finish without hitting the request ceiling, and a
+/// run without them still works for everything public.
+fn cookies_from(path: Option<&Path>) -> Option<Jar> {
+    let path = path?;
+    match Jar::load(path) {
         Ok(jar) => {
             eprintln!("yt-transcribe mcp: cookies: {} entry(ies)", jar.len());
             Some(jar)
@@ -213,10 +221,6 @@ fn cookies() -> Option<Jar> {
             None
         }
     }
-}
-
-fn model_dir() -> PathBuf {
-    crate::resolve_model(Path::new("models/tdt"))
 }
 
 fn error(message: String) -> CallToolResult {
@@ -285,7 +289,9 @@ impl Server {
             Ok(pair) => pair,
             Err(e) => return Ok(error(e.to_string())),
         };
-        let target_dir = output_dir(dir);
+        // One chain, two frontes: the caller's `dir`/`lang`/`force` are this front's flags.
+        let plan = self.plan(dir.as_deref(), lang.as_deref(), force);
+        let target_dir = plan.output.clone();
         if let Err(e) = std::fs::create_dir_all(&target_dir) {
             return Ok(error(format!(
                 "could not create {}: {e}",
@@ -304,10 +310,10 @@ impl Server {
 
         let jobs = self.jobs.clone();
         let key = stem.clone();
-        let model = model_dir();
-        let cookies = cookies();
-        let force = force.unwrap_or(false);
-        let lang = lang.clone();
+        let model = plan.model.clone();
+        let cookies = cookies_from(plan.cookies.as_deref());
+        let force = plan.force;
+        let lang = plan.lang.clone();
 
         // The job takes copies: the response below still needs the originals.
         let job_source = source.clone();
@@ -366,7 +372,7 @@ impl Server {
         &self,
         Parameters(StatusParams { document, dir }): Parameters<StatusParams>,
     ) -> Result<CallToolResult, McpError> {
-        let dir_path = output_dir(dir);
+        let dir_path = self.plan(dir.as_deref(), None, None).output;
         let cues = match registry::read(&registry::path(&dir_path, &document)) {
             Ok(cues) => cues,
             Err(e) => return Ok(error(format!("could not read the cue registry: {e}"))),
@@ -404,7 +410,7 @@ impl Server {
             context,
         }): Parameters<ResultParams>,
     ) -> Result<CallToolResult, McpError> {
-        let dir_path = output_dir(dir);
+        let dir_path = self.plan(dir.as_deref(), None, None).output;
         let cues = match registry::read(&registry::path(&dir_path, &document)) {
             Ok(cues) => cues,
             Err(e) => return Ok(error(format!("could not read the cue registry: {e}"))),
@@ -577,16 +583,12 @@ pub async fn serve_http(address: &str) -> Result<(), Box<dyn std::error::Error>>
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
 
-    // One job table for the whole process: a session may submit and another may cancel, and both
-    // must see the same jobs.
-    let jobs = Arc::new(Jobs::default());
+    // One job table -- and one configuration -- for the whole process: a session may submit and
+    // another may cancel, and both must see the same jobs and the same chain.
+    let template = Server::new();
 
     let mcp_service: StreamableHttpService<Server, LocalSessionManager> = StreamableHttpService::new(
-        move || {
-            Ok(Server {
-                jobs: jobs.clone(),
-            })
-        },
+        move || Ok(template.clone()),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default(),
     );

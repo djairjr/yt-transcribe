@@ -1,0 +1,8 @@
+{
+  "lang": "pt",
+  "output": "~/.local/share/yt-transcribe",
+  "model": "/usr/share/yt-transcribe/models/tdt",
+  "cookies": "~/.config/yt-transcribe/cookies.txt",
+  "force_transcribe": false,
+  "force": false
+}
