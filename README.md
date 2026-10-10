@@ -250,7 +250,7 @@ src/
 ├── task.rs                 the job record on disk (<stem>.task.json)
 ├── mcp.rs                  the MCP server (5 tools, stdio and HTTP)
 ├── ingest/                 YouTube ingestion (replaces yt-dlp)
-│   ├── watch.rs            watch page -> ytInitialPlayerResponse
+│   ├── watch.rs            watch page -> innertube bootstrap (API key, visitor data)
 │   ├── innertube.rs        POST /youtubei/v1/player
 │   ├── clients.rs          innertube client table (visionos, ios, android_vr)
 │   ├── formats.rs          audio-only format selection, and why there is none

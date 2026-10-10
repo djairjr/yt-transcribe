@@ -1,18 +1,18 @@
 //! Media streaming: HTTP Range GET against a resolved format URL.
+//!
+//! Only the caller-provided-client form is here. The media URL belongs to the client that
+//! issued it, and the AVIO read callback issues many requests with one client -- so this module
+//! never builds a client of its own. It used to carry a second entry point with the
+//! `android_vr` user agent baked in (and a diagnostic that read a stream to prove the bytes
+//! flowed in chunks); both were removed 2026-10-10, unexercised, when the media client became
+//! `visionos` and the UA stopped being part of this path.
 
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use std::error::Error;
 
-/// The media URL was issued to the android_vr client, so the request must carry
-/// the same UA or googlevideo may answer 403.
-const UA: &str = "com.google.android.apps.youtube.vr.oculus/1.65.10 \
-                  (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
-
 pub struct RangeResponse {
     pub status: StatusCode,
-    pub content_range: Option<String>,
-    pub content_length: Option<u64>,
     pub bytes: Vec<u8>,
 }
 
@@ -20,13 +20,9 @@ pub struct RangeResponse {
 ///
 /// For a bounded range this returns exactly that many bytes, which is what
 /// makes it safe to call before deciding whether to stream.
-pub fn range_get(url: &str, range: Option<&str>) -> Result<RangeResponse, Box<dyn Error>> {
-    let client = Client::builder().user_agent(UA).build()?;
-    range_get_with(&client, url, range)
-}
-
-/// Same as [`range_get`], with a caller-provided client (the AVIO read callback
-/// issues many requests and must not rebuild the client each time).
+///
+/// The client is passed in by the caller: the AVIO read callback issues many requests and must not
+/// rebuild the client each time.
 pub fn range_get_with(
     client: &Client,
     url: &str,
@@ -38,19 +34,8 @@ pub fn range_get_with(
     }
     let resp = req.send()?;
     let status = resp.status();
-    let content_range = resp
-        .headers()
-        .get("content-range")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let content_length = resp.content_length();
     let bytes = resp.bytes()?.to_vec();
-    Ok(RangeResponse {
-        status,
-        content_range,
-        content_length,
-        bytes,
-    })
+    Ok(RangeResponse { status, bytes })
 }
 
 /// Total length of the resource, via a HEAD request (needed for media seeking).
@@ -60,30 +45,4 @@ pub fn content_length(client: &Client, url: &str) -> Option<u64> {
         .send()
         .ok()
         .and_then(|r| r.content_length())
-}
-
-/// Read the body as a stream and return the total byte count, aborting after
-/// `max_bytes`. Proves bytes actually flow rather than arriving in one block.
-pub fn read_stream(url: &str, max_bytes: usize) -> Result<usize, Box<dyn Error>> {
-    use std::io::Read;
-    let client = Client::builder().user_agent(UA).build()?;
-    let mut resp = client
-        .get(url)
-        .header("Range", "bytes=0-")
-        .header("Accept", "*/*")
-        .send()?
-        .error_for_status()?;
-    let mut total = 0usize;
-    let mut buf = [0u8; 64 * 1024];
-    let mut chunks = 0usize;
-    while total < max_bytes {
-        let n = resp.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        total += n;
-        chunks += 1;
-    }
-    eprintln!("stream: {total} bytes in {chunks} chunk(s)");
-    Ok(total)
 }
