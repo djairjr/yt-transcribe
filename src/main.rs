@@ -288,7 +288,7 @@ fn main() {
 
     match &cli.command {
         Some(Command::Mcp { transport, address }) => {
-            std::process::exit(serve_mcp(transport, address));
+            std::process::exit(serve_mcp(transport, address, cli.config.as_deref()));
         }
         Some(Command::Config { action }) => {
             std::process::exit(config_cli(&cli, action));
@@ -482,6 +482,10 @@ pub(crate) fn effective_mcp(
     let (model, model_origin) = resolve_model(world, None, file.model.as_deref());
     let (cookies, cookies_origin) = pick_opt(world.cookies.clone(), None, file.cookies.clone());
     let (force, force_origin) = pick_switch(force.unwrap_or(false), file.force);
+    // `submit` has no switch of its own for this, but the file may ask for it -- and a server
+    // configured to ignore captions that still answered with captions was a real defect (measured
+    // 2026-10-10): one chain, two frontes.
+    let (force_transcribe, force_transcribe_origin) = pick_switch(false, file.force_transcribe);
 
     Effective {
         lang,
@@ -492,9 +496,8 @@ pub(crate) fn effective_mcp(
         model_origin,
         cookies,
         cookies_origin,
-        // The server has no switch for this: `submit` never asks to ignore captions.
-        force_transcribe: false,
-        force_transcribe_origin: Origin::Default,
+        force_transcribe,
+        force_transcribe_origin,
         force,
         force_origin,
     }
@@ -509,7 +512,14 @@ pub(crate) fn load_config(
     world: &World,
 ) -> Result<config::Config, Box<dyn Error>> {
     match config::resolve(explicit, &world.env)? {
-        Some((_, cfg)) => Ok(cfg),
+        Some((_, mut cfg)) => {
+            // `~` in the file is the user's home, measured 2026-10-10: without this the run created
+            // a directory named literally `~` next to wherever it happened to be started.
+            cfg.output = cfg.output.as_deref().map(|p| config::expand_tilde(p, &world.env));
+            cfg.model = cfg.model.as_deref().map(|p| config::expand_tilde(p, &world.env));
+            cfg.cookies = cfg.cookies.as_deref().map(|p| config::expand_tilde(p, &world.env));
+            Ok(cfg)
+        }
         None => Ok(config::Config::default()),
     }
 }
@@ -672,8 +682,16 @@ fn exit_for(task: &task::Task) -> i32 {
 /// recorded nothing never did the work. Reading it from disk rather than from memory is the same
 /// rule `status` follows.
 fn failed_exit(dir: &Path, stem: &str) -> i32 {
+    // The registry is what counts, and it is read from disk on purpose: measured 2026-10-10, a
+    // caption run that failed while deriving left six cues in the registry while the record said
+    // nothing, and the run reported 2 -- "nothing came out of it" -- for a transcript a person
+    // could read.
+    let on_disk = output::cues::read(&output::cues::path(dir, stem))
+        .map(|cues| cues.len())
+        .unwrap_or(0);
     match task::read(dir, stem).ok().flatten() {
-        Some(t) if t.chunks_done > 0 || t.cues > 0 => READ_ME,
+        Some(t) if t.chunks_done > 0 || t.cues > 0 || on_disk > 0 => READ_ME,
+        _ if on_disk > 0 => READ_ME,
         _ => COULD_NOT_WORK,
     }
 }
@@ -682,7 +700,7 @@ fn failed_exit(dir: &Path, stem: &str) -> i32 {
 ///
 /// Over stdio, nothing here may write to stdout: stdout is the protocol channel, and a stray
 /// `println!` corrupts the conversation with the client. Diagnostics go to stderr, in both modes.
-fn serve_mcp(transport: &str, address: &str) -> i32 {
+fn serve_mcp(transport: &str, address: &str, config_path: Option<&Path>) -> i32 {
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -695,8 +713,8 @@ fn serve_mcp(transport: &str, address: &str) -> i32 {
     };
 
     let result = match transport {
-        "stdio" => rt.block_on(mcp::serve()),
-        "http" => rt.block_on(mcp::serve_http(address)),
+        "stdio" => rt.block_on(mcp::serve(config_path)),
+        "http" => rt.block_on(mcp::serve_http(address, config_path)),
         other => {
             eprintln!("error: unknown transport: {other:?} -- use \"stdio\" or \"http\"");
             return COULD_NOT_WORK;
@@ -760,6 +778,25 @@ mod tests {
         // A record that never got a single block down.
         task::write(&dir, &record("nothing", "failed", Some("decode"), 0, 0)).unwrap();
         assert_eq!(failed_exit(&dir, "nothing"), COULD_NOT_WORK);
+    }
+
+    #[test]
+    fn a_run_that_left_cues_on_disk_but_no_count_in_the_record_asks_for_a_look() {
+        // Measured 2026-10-10: a caption run that failed while deriving left six cues in the
+        // registry while the record said nothing -- and the run reported 2, "nothing came out of
+        // it", for a transcript a person could read.
+        let dir = fresh_dir("residue");
+        task::write(&dir, &record("residue", "failed", Some("derive"), 0, 0)).unwrap();
+        let cues: Vec<crate::output::Cue> = (0..6)
+            .map(|i| crate::output::Cue {
+                chunk: 0,
+                start: i as f32,
+                end: i as f32 + 0.5,
+                text: format!("cue {i}"),
+            })
+            .collect();
+        output::cues::append(&output::cues::path(&dir, "residue"), &cues).unwrap();
+        assert_eq!(failed_exit(&dir, "residue"), READ_ME);
     }
 
     #[test]
@@ -960,6 +997,19 @@ mod tests {
             PathBuf::from("/home/fake/.local/share/yt-transcribe")
         );
         assert_eq!(by_default.output_origin, Origin::Default);
+    }
+
+    #[test]
+    fn the_server_takes_force_transcribe_from_the_file() {
+        // The server has no switch of its own for it, but the file may ask -- and answering with
+        // captions while the file says to ignore them was a real defect.
+        let file = config::Config {
+            force_transcribe: Some(true),
+            ..Default::default()
+        };
+        let plan = effective_mcp(&fake_world(), &file, None, None, None);
+        assert!(plan.force_transcribe);
+        assert_eq!(plan.force_transcribe_origin, Origin::File);
     }
 
     #[test]

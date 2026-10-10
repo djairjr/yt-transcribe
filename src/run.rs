@@ -54,13 +54,56 @@ pub fn transcribe(
     std::fs::create_dir_all(opts.dir)?;
 
     let cues_path = registry::path(opts.dir, &stem);
-    if opts.force {
+    // What the previous run produced, and of what kind. Read before anything else, because a
+    // caption registry is not a partial transcript.
+    let prior = task::read(opts.dir, &stem)?;
+    let prior_captions = prior.as_ref().is_some_and(|t| t.output_kind == "captions");
+    let prior_finished = prior.as_ref().is_some_and(|t| t.state == "finished");
+
+    // The registry starts empty when the run is meant to redo the work: `--force` ("again, ignoring
+    // what is recorded"), `--force-transcribe` over captions ("ignore them and transcribe instead"),
+    // or a caption registry that was left `cancelled` or `failed` -- that one is not complete work,
+    // and refetching captions APPENDS, so it has to be cleared first. Measured 2026-10-10: with the
+    // reset after the flag was computed, `--force` answered "already transcribed" and never redid
+    // anything, and a run after a Ctrl-C stayed `cancelled` forever.
+    let reset = opts.force
+        || (opts.force_transcribe && prior_captions)
+        || (prior_captions && !prior_finished);
+    if reset {
         let _ = std::fs::remove_file(&cues_path);
     }
+
     // The registry is the truth about what was already paid for.
     let recorded = registry::read(&cues_path)?;
-    let resume = !opts.force && !recorded.is_empty();
+    // A FINISHED caption registry is complete work, not a first ASR block: re-running the command
+    // does nothing (measured 2026-10-10: it used to log "resuming at block 1", skip the caption
+    // lookup and append ASR from four minutes in, flipping the record's kind).
+    let captions_done = prior_captions
+        && prior_finished
+        && !recorded.is_empty()
+        && !opts.force
+        && !opts.force_transcribe;
+    let resume = !opts.force && !recorded.is_empty() && !captions_done;
     let from_chunk = registry::last_chunk(&recorded).map(|c| c + 1).unwrap_or(0);
+
+    // A complete caption registry means there is nothing to do: the record that already exists IS
+    // the answer, and rewriting it from a fresh Task wiped its `output_kind` and `language`
+    // (measured 2026-10-10).
+    if captions_done && !opts.force_transcribe && !opts.force {
+        let mut done = prior.expect("captions_done implies a record to read");
+        let all = registry::read(&cues_path)?;
+        done.cues = all.len();
+        done.seconds = all.last().map(|c| c.end as f64).unwrap_or(0.0);
+        if opts.verbose {
+            eprintln!("captions: already transcribed -- nothing to do");
+        }
+        return Ok(Outcome {
+            task: done,
+            srt: opts.dir.join(format!("{stem}.srt")),
+            txt: opts.dir.join(format!("{stem}.txt")),
+            cues_path,
+        });
+    }
 
     let mut task = Task {
         stem: stem.clone(),
@@ -82,34 +125,55 @@ pub fn transcribe(
         );
     }
 
-    let work = walk(source, kind, &stem, opts, cancel, from_chunk, resume, &mut task);
-    match work {
-        Ok(()) => {
-            let all = registry::read(&cues_path)?;
-            let n = registry::derive(&all, opts.dir, &stem)?;
-            task.cues = all.len();
-            task.seconds = all.last().map(|c| c.end as f64).unwrap_or(0.0);
-            if task.state == "running" {
-                task.state = "finished".to_string();
-            }
-            task.finished_at = Some(task::now());
-            task::write(opts.dir, &task)?;
-            if opts.verbose {
-                eprintln!(
-                    "transcribed: {n} cues, {:.1} s of audio ({})",
-                    task.seconds, task.state
-                );
-            }
-            Ok(Outcome {
-                task,
-                srt: opts.dir.join(format!("{stem}.srt")),
-                txt: opts.dir.join(format!("{stem}.txt")),
-                cues_path,
-            })
+    let work = walk(
+        source,
+        kind,
+        &stem,
+        opts,
+        cancel,
+        from_chunk,
+        resume,
+        captions_done,
+        &mut task,
+    );
+    // Everything below runs through ONE closing of the record, because the failure that leaves a
+    // record open is the failure nobody sees: measured 2026-10-10, a caption run whose derivation
+    // failed returned early through `?` and left `state: running` and `cues: 0` on disk while six
+    // cues were sitting in the registry.
+    let finished = work.and_then(|()| {
+        let all = registry::read(&cues_path)?;
+        let n = registry::derive(&all, opts.dir, &stem)?;
+        task.cues = all.len();
+        task.seconds = all.last().map(|c| c.end as f64).unwrap_or(0.0);
+        if task.state == "running" {
+            task.state = "finished".to_string();
         }
+        task.finished_at = Some(task::now());
+        task::write(opts.dir, &task)?;
+        if opts.verbose {
+            eprintln!(
+                "transcribed: {n} cues, {:.1} s of audio ({})",
+                task.seconds, task.state
+            );
+        }
+        Ok(())
+    });
+    match finished {
+        Ok(()) => Ok(Outcome {
+            task,
+            srt: opts.dir.join(format!("{stem}.srt")),
+            txt: opts.dir.join(format!("{stem}.txt")),
+            cues_path,
+        }),
         Err(e) => {
             task.state = "failed".to_string();
             task.error = Some(e.to_string());
+            // The count comes from the registry, not from memory: a caption run whose derivation
+            // failed kept its cues on disk, and `failed_exit` reads this number to decide between
+            // "there is something to look at" (1) and "nothing came out of it" (2).
+            let on_disk = registry::read(&cues_path).unwrap_or_default();
+            task.cues = on_disk.len();
+            task.seconds = on_disk.last().map(|c| c.end as f64).unwrap_or(0.0);
             task.finished_at = Some(task::now());
             let _ = task::write(opts.dir, &task);
             Err(e)
@@ -152,10 +216,11 @@ fn walk(
     cancel: &AtomicBool,
     from_chunk: usize,
     resume: bool,
+    captions_done: bool,
     task: &mut Task,
 ) -> Result<(), Box<dyn Error>> {
     match kind {
-        "youtube" => walk_youtube(source, stem, opts, cancel, from_chunk, resume, task),
+        "youtube" => walk_youtube(source, stem, opts, cancel, from_chunk, resume, captions_done, task),
         "network" => {
             let ua = std::env::var("YT_USER_AGENT").ok();
             let headers = opts.cookies.and_then(|jar| jar.ffmpeg_headers(source));
@@ -186,6 +251,7 @@ fn report_decoded(bytes: &[u8], opts: &Options) {
 ///
 /// A resume skips the caption track entirely: something is already transcribed, and what is being
 /// continued is the ASR blocks. Re-taking the captions there would append them twice.
+#[allow(clippy::too_many_arguments)]
 fn walk_youtube(
     source: &str,
     stem: &str,
@@ -193,8 +259,17 @@ fn walk_youtube(
     cancel: &AtomicBool,
     from_chunk: usize,
     resume: bool,
+    captions_done: bool,
     task: &mut Task,
 ) -> Result<(), Box<dyn Error>> {
+    // Nothing to do and nothing to ask YouTube for: the caption transcript is already complete.
+    if captions_done && !opts.force_transcribe {
+        if opts.verbose {
+            eprintln!("captions: already transcribed -- nothing to do");
+        }
+        return Ok(());
+    }
+
     let page = ingest::watch::watch_page(source, opts.cookies)?;
 
     if !opts.force_transcribe && !resume {
@@ -208,6 +283,13 @@ fn walk_youtube(
             Some((_text, cues, language)) => {
                 task.output_kind = "captions".to_string();
                 task.language = language;
+                // A stop asked for while the captions were being fetched is honoured here, at the
+                // boundary this route has: the captions arrived whole, so they are kept, but the
+                // record says `cancelled` and the run leaves code 1 -- otherwise the documented
+                // stop was silently ignored on the captions-first route (measured 2026-10-10).
+                if cancel.load(Ordering::Relaxed) {
+                    task.state = "cancelled".to_string();
+                }
                 let tagged: Vec<Cue> = cues
                     .into_iter()
                     .map(|mut c| {
