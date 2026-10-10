@@ -20,6 +20,7 @@
 
 mod asr;
 mod audio;
+mod config;
 mod ingest;
 mod mcp;
 mod output;
@@ -44,7 +45,13 @@ Exit codes, one meaning for the whole family:
 
 Ctrl-C asks the run to stop between blocks: the block in flight finishes and is recorded, the
 record is left as `cancelled`, and the exit code is 1. A second Ctrl-C refuses to wait and exits 2.
-Nothing already recorded is redone, so running the same command again resumes from there."
+Nothing already recorded is redone, so running the same command again resumes from there.
+
+Configuration, when there is one, is read from --config, then $YT_TRANSCRIBE_CONFIG, then
+$XDG_CONFIG_HOME/yt-transcribe/config.json (~/.config/yt-transcribe/config.json), then
+/etc/yt-transcribe/config.json. Every key is optional, none of them is required, and a run with no
+file behaves exactly as it did before the file existed. `yt-transcribe config show` says what was
+read and which step decided each value."
 )]
 struct Cli {
     /// A YouTube URL, an http(s) media URL (direct file or HLS/DASH playlist),
@@ -62,13 +69,16 @@ struct Cli {
     #[arg(short, long)]
     lang: Option<String>,
 
-    /// Output directory.
-    #[arg(short, long, default_value = ".")]
-    output: PathBuf,
+    /// Output directory. Default: `.`, or the `output` key of the configuration file.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
 
-    /// Model directory (encoder/decoder_joint ONNX + vocab.txt).
-    #[arg(short, long, default_value = "models/tdt")]
-    model: PathBuf,
+    /// Model directory (encoder/decoder_joint ONNX + vocab.txt). Default: the first of
+    /// `$YT_TRANSCRIBE_MODEL`, the `model` key of the configuration file,
+    /// `/usr/share/yt-transcribe/models/tdt`, `~/.local/share/yt-transcribe/models/tdt`
+    /// and `models/tdt` that exists.
+    #[arg(short, long)]
+    model: Option<PathBuf>,
 
     /// Ignore existing captions and always transcribe the audio.
     #[arg(long)]
@@ -85,6 +95,15 @@ struct Cli {
     #[arg(long)]
     force: bool,
 
+    /// Configuration file. Default: the first of `$YT_TRANSCRIBE_CONFIG`,
+    /// `$XDG_CONFIG_HOME/yt-transcribe/config.json`, `~/.config/yt-transcribe/config.json`
+    /// and `/etc/yt-transcribe/config.json` that exists. Naming one that is not there is an error.
+    ///
+    /// `global`, so it is accepted after a subcommand too: `config show --config <path>` is how the
+    /// family contract writes it.
+    #[arg(long, value_name = "FILE", global = true)]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -100,29 +119,157 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:9730")]
         address: String,
     },
+    /// What the program really read, and which step decided each value.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
 }
 
-/// Where to look for the ONNX model, in order: the `--model` value, then the
-/// system and per-user data dirs (used by the .deb install), then the crate's
-/// own default.
-pub(crate) fn resolve_model(cli_model: &Path) -> PathBuf {
-    if cli_model.is_dir() {
-        return cli_model.to_path_buf();
-    }
-    let mut candidates = Vec::new();
-    if let Ok(dir) = std::env::var("YT_TRANSCRIBE_MODEL") {
-        candidates.push(PathBuf::from(dir));
-    }
-    candidates.push(PathBuf::from("/usr/share/yt-transcribe/models/tdt"));
-    if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(PathBuf::from(home).join(".local/share/yt-transcribe/models/tdt"));
-    }
-    for c in candidates {
-        if c.is_dir() {
-            return c;
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Show the configuration file in force and the value in force for every key.
+    Show,
+}
+
+/// Everything the process reads from outside itself, read once and passed down.
+///
+/// The rule the family follows: no function of the logic reads an environment variable on its own.
+/// The binary reads them here, and everything below takes them as parameters -- which is exactly
+/// what makes the chain testable without mutating the process environment (a trap: it breaks under
+/// parallel tests).
+pub(crate) struct World {
+    pub env: config::Environment,
+    /// `$YT_TRANSCRIBE_MODEL`.
+    pub model: Option<PathBuf>,
+    /// `$YT_TRANSCRIBE_DIR` -- the server's counterpart of `--output`.
+    pub dir: Option<PathBuf>,
+    /// `$YT_COOKIES` -- the server's counterpart of `--cookies`.
+    pub cookies: Option<PathBuf>,
+}
+
+impl World {
+    /// Reads the process's REAL environment. Only the binary calls this.
+    pub(crate) fn real() -> Self {
+        let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+        Self {
+            env: config::Environment::real(),
+            model: var("YT_TRANSCRIBE_MODEL"),
+            dir: var("YT_TRANSCRIBE_DIR"),
+            cookies: var("YT_COOKIES"),
         }
     }
-    cli_model.to_path_buf()
+}
+
+/// Where a value came from. The chain is flag > environment > file > default, and `config show`
+/// reports which step decided each value, so a person can see WHY they got what they got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    Flag,
+    Environment,
+    File,
+    Default,
+}
+
+impl Origin {
+    fn label(self) -> &'static str {
+        match self {
+            Origin::Flag => "flag",
+            Origin::Environment => "environment",
+            Origin::File => "config file",
+            Origin::Default => "default",
+        }
+    }
+}
+
+/// The output directory a command-line run uses when nothing else says so.
+const DEFAULT_OUTPUT: &str = ".";
+/// Where the crate looks for the model when nothing else says so.
+const DEFAULT_MODEL: &str = "models/tdt";
+
+/// One key's walk down the chain: the flag, then the environment, then the file, then the built-in
+/// default. One function, so the run and `config show` can never disagree about the order.
+fn pick<T: Clone>(flag: Option<T>, env: Option<T>, file: Option<T>, default: T) -> (T, Origin) {
+    if let Some(v) = flag {
+        return (v, Origin::Flag);
+    }
+    if let Some(v) = env {
+        return (v, Origin::Environment);
+    }
+    if let Some(v) = file {
+        return (v, Origin::File);
+    }
+    (default, Origin::Default)
+}
+
+/// Like [`pick`], for a key whose absence is a value: nothing declared means `None`, and the
+/// origin says so.
+fn pick_opt<T: Clone>(flag: Option<T>, env: Option<T>, file: Option<T>) -> (Option<T>, Origin) {
+    if let Some(v) = flag {
+        return (Some(v), Origin::Flag);
+    }
+    if let Some(v) = env {
+        return (Some(v), Origin::Environment);
+    }
+    if let Some(v) = file {
+        return (Some(v), Origin::File);
+    }
+    (None, Origin::Default)
+}
+
+/// A switch has no "not declared" state on the command line (there is no `--no-force-transcribe`),
+/// so the chain is a decision rather than a lookup: the flag asks for it, the file may ask for it,
+/// and nothing asks for it.
+fn pick_switch(flag: bool, file: Option<bool>) -> (bool, Origin) {
+    if flag {
+        return (true, Origin::Flag);
+    }
+    match file {
+        Some(v) => (v, Origin::File),
+        None => (false, Origin::Default),
+    }
+}
+
+/// The output directory for the server, when the caller and the environment are both silent.
+pub(crate) fn data_dir(env: &config::Environment) -> PathBuf {
+    env.home
+        .as_ref()
+        .map(|home| home.join(".local/share/yt-transcribe"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Where to look for the ONNX model, in order: `--model` when it is a directory, then
+/// `$YT_TRANSCRIBE_MODEL`, then the file's `model`, then the system and per-user data dirs (where
+/// the .deb installs it), then the crate's own default.
+///
+/// A value that is not a directory falls through rather than failing here: that is what this tool
+/// has always done with a model path that is not there, and the run reports the missing directory
+/// where it matters, naming what it looked for.
+pub(crate) fn resolve_model(
+    world: &World,
+    flag: Option<&Path>,
+    file: Option<&Path>,
+) -> (PathBuf, Origin) {
+    if let Some(p) = flag.filter(|p| p.is_dir()) {
+        return (p.to_path_buf(), Origin::Flag);
+    }
+    if let Some(p) = world.model.clone().filter(|p| p.is_dir()) {
+        return (p, Origin::Environment);
+    }
+    if let Some(p) = file.filter(|p| p.is_dir()) {
+        return (p.to_path_buf(), Origin::File);
+    }
+    let mut candidates = vec![PathBuf::from("/usr/share/yt-transcribe/models/tdt")];
+    if let Some(home) = world.env.home.as_ref() {
+        candidates.push(home.join(".local/share/yt-transcribe/models/tdt"));
+    }
+    if let Some(c) = candidates.into_iter().find(|c| c.is_dir()) {
+        return (c, Origin::Default);
+    }
+    (
+        flag.or(file).unwrap_or(Path::new(DEFAULT_MODEL)).to_path_buf(),
+        Origin::Default,
+    )
 }
 
 /// The exit codes, and there is one meaning for the whole family — a script that calls this tool or
@@ -139,8 +286,14 @@ const COULD_NOT_WORK: i32 = 2;
 fn main() {
     let cli = Cli::parse();
 
-    if let Some(Command::Mcp { transport, address }) = cli.command {
-        std::process::exit(serve_mcp(&transport, &address));
+    match &cli.command {
+        Some(Command::Mcp { transport, address }) => {
+            std::process::exit(serve_mcp(transport, address));
+        }
+        Some(Command::Config { action }) => {
+            std::process::exit(config_cli(&cli, action));
+        }
+        None => {}
     }
 
     std::process::exit(transcribe_cli(&cli));
@@ -256,19 +409,183 @@ fn install_signal_handler() {
     }
 }
 
+/// The values a run really uses, each with the step that decided it.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Effective {
+    pub lang: Option<String>,
+    pub lang_origin: Origin,
+    pub output: PathBuf,
+    pub output_origin: Origin,
+    pub model: PathBuf,
+    pub model_origin: Origin,
+    pub cookies: Option<PathBuf>,
+    pub cookies_origin: Origin,
+    pub force_transcribe: bool,
+    pub force_transcribe_origin: Origin,
+    pub force: bool,
+    pub force_origin: Origin,
+}
+
+/// Walk the whole chain for a command-line run.
+fn effective_cli(cli: &Cli, world: &World, file: &config::Config) -> Effective {
+    let (lang, lang_origin) = pick_opt(cli.lang.clone(), None, file.lang.clone());
+    let (output, output_origin) = pick(
+        cli.output.clone(),
+        None,
+        file.output.clone(),
+        PathBuf::from(DEFAULT_OUTPUT),
+    );
+    let (model, model_origin) = resolve_model(world, cli.model.as_deref(), file.model.as_deref());
+    let (cookies, cookies_origin) = pick_opt(cli.cookies.clone(), None, file.cookies.clone());
+    let (force_transcribe, force_transcribe_origin) =
+        pick_switch(cli.force_transcribe, file.force_transcribe);
+    let (force, force_origin) = pick_switch(cli.force, file.force);
+
+    Effective {
+        lang,
+        lang_origin,
+        output,
+        output_origin,
+        model,
+        model_origin,
+        cookies,
+        cookies_origin,
+        force_transcribe,
+        force_transcribe_origin,
+        force,
+        force_origin,
+    }
+}
+
+/// Walk the same chain for the server, where the caller's arguments take the place of the flags.
+///
+/// One chain, two frontes: the server must not invent a second precedence, or `status` and the
+/// command line would disagree about where a transcript lands on the same machine.
+pub(crate) fn effective_mcp(
+    world: &World,
+    file: &config::Config,
+    dir: Option<&str>,
+    lang: Option<&str>,
+    force: Option<bool>,
+) -> Effective {
+    let caller_dir = dir
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from);
+    let (lang, lang_origin) = pick_opt(lang.map(str::to_string), None, file.lang.clone());
+    let (output, output_origin) = pick(
+        caller_dir,
+        world.dir.clone(),
+        file.output.clone(),
+        data_dir(&world.env),
+    );
+    let (model, model_origin) = resolve_model(world, None, file.model.as_deref());
+    let (cookies, cookies_origin) = pick_opt(world.cookies.clone(), None, file.cookies.clone());
+    let (force, force_origin) = pick_switch(force.unwrap_or(false), file.force);
+
+    Effective {
+        lang,
+        lang_origin,
+        output,
+        output_origin,
+        model,
+        model_origin,
+        cookies,
+        cookies_origin,
+        // The server has no switch for this: `submit` never asks to ignore captions.
+        force_transcribe: false,
+        force_transcribe_origin: Origin::Default,
+        force,
+        force_origin,
+    }
+}
+
+/// The configuration file in force, or an empty one when no file exists anywhere.
+///
+/// An empty configuration is not a degraded state: every key is optional, so the defaults below it
+/// in the chain are exactly what a machine without a file has always used.
+pub(crate) fn load_config(
+    explicit: Option<&Path>,
+    world: &World,
+) -> Result<config::Config, Box<dyn Error>> {
+    match config::resolve(explicit, &world.env)? {
+        Some((_, cfg)) => Ok(cfg),
+        None => Ok(config::Config::default()),
+    }
+}
+
+/// `config show`: what the program really read, and which step decided each value.
+fn config_cli(cli: &Cli, action: &ConfigAction) -> i32 {
+    match action {
+        ConfigAction::Show => {
+            let world = World::real();
+            let found = match config::resolve(cli.config.as_deref(), &world.env) {
+                Ok(found) => found,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return COULD_NOT_WORK;
+                }
+            };
+            match &found {
+                Some((path, _)) => println!("file       {}", path.display()),
+                None => println!("file       none -- the built-in defaults are in force"),
+            }
+            println!("looked in:");
+            for p in config::candidates(cli.config.as_deref(), &world.env) {
+                println!("             {}", p.display());
+            }
+
+            let file = found.map(|(_, cfg)| cfg).unwrap_or_default();
+            let plan = effective_cli(cli, &world, &file);
+            let show = |name: &str, value: String, origin: Origin| {
+                println!("{name:<17}{value}  ({})", origin.label())
+            };
+            show("lang", plan.lang.unwrap_or_else(|| "none".to_string()), plan.lang_origin);
+            show("output", plan.output.display().to_string(), plan.output_origin);
+            show("model", plan.model.display().to_string(), plan.model_origin);
+            show(
+                "cookies",
+                plan.cookies
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                plan.cookies_origin,
+            );
+            show(
+                "force_transcribe",
+                plan.force_transcribe.to_string(),
+                plan.force_transcribe_origin,
+            );
+            show("force", plan.force.to_string(), plan.force_origin);
+            NOTHING_TO_READ
+        }
+    }
+}
+
 /// Transcribe from the command line, report where everything landed, and say how it went in the
 /// exit code.
 fn transcribe_cli(cli: &Cli) -> i32 {
-    let model = resolve_model(&cli.model);
-    if let Err(e) = std::fs::create_dir_all(&cli.output) {
-        eprintln!("error: could not use {} as the output directory: {e}", cli.output.display());
+    let world = World::real();
+    let file = match load_config(cli.config.as_deref(), &world) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return COULD_NOT_WORK;
+        }
+    };
+    let plan = effective_cli(cli, &world, &file);
+
+    if let Err(e) = std::fs::create_dir_all(&plan.output) {
+        eprintln!(
+            "error: could not use {} as the output directory: {e}",
+            plan.output.display()
+        );
         return COULD_NOT_WORK;
     }
 
     // Loaded once, before any network work: an unreadable cookie file has to fail
     // here, where the message can name the file, and not midway through a queue.
     // Only the count is ever reported -- never a value.
-    let cookies = match cli.cookies.as_deref() {
+    let cookies = match plan.cookies.as_deref() {
         Some(path) => match ingest::cookies::Jar::load(path) {
             Ok(jar) => {
                 eprintln!("cookies: {} entry(ies)", jar.len());
@@ -300,12 +617,12 @@ fn transcribe_cli(cli: &Cli) -> i32 {
     }
 
     let options = run::Options {
-        model: &model,
-        dir: &cli.output,
-        lang: cli.lang.as_deref(),
+        model: &plan.model,
+        dir: &plan.output,
+        lang: plan.lang.as_deref(),
         cookies: cookies.as_ref(),
-        force_transcribe: cli.force_transcribe,
-        force: cli.force,
+        force_transcribe: plan.force_transcribe,
+        force: plan.force,
         verbose: true,
         dump_url: std::env::var("YT_DUMP_URL").is_ok(),
     };
@@ -316,7 +633,7 @@ fn transcribe_cli(cli: &Cli) -> i32 {
         Ok(outcome) => outcome,
         Err(e) => {
             eprintln!("error: {e}");
-            return failed_exit(&cli.output, &stem);
+            return failed_exit(&plan.output, &stem);
         }
     };
 
@@ -492,5 +809,166 @@ mod tests {
         let previous = unsafe { libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t) };
         assert_ne!(previous, libc::SIG_ERR, "signal() rejected the handler");
         unsafe { libc::signal(libc::SIGINT, previous) };
+    }
+
+    // -----------------------------------------------------------------------
+    // The configuration chain. Every test here owns its `World`: nothing reads
+    // the process environment, which is what makes them safe in parallel.
+    // -----------------------------------------------------------------------
+
+    fn fake_world() -> World {
+        World {
+            env: config::Environment {
+                home: Some(PathBuf::from("/home/fake")),
+                xdg_config_home: None,
+                env_config: None,
+            },
+            model: None,
+            dir: None,
+            cookies: None,
+        }
+    }
+
+    /// A parsed command line, with an input these tests never touch.
+    fn cli_with(args: &[&str]) -> Cli {
+        let mut full = vec!["yt-transcribe", "https://www.youtube.com/watch?v=x"];
+        full.extend_from_slice(args);
+        Cli::parse_from(full)
+    }
+
+    fn a_directory(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("yt-transcribe-chain-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_chain_is_flag_then_file_then_default() {
+        let world = fake_world();
+        let file = config::Config {
+            output: Some(PathBuf::from("/from/file")),
+            ..Default::default()
+        };
+
+        let by_flag = effective_cli(&cli_with(&["-o", "/from/flag"]), &world, &file);
+        assert_eq!(by_flag.output, PathBuf::from("/from/flag"));
+        assert_eq!(by_flag.output_origin, Origin::Flag);
+
+        let by_file = effective_cli(&cli_with(&[]), &world, &file);
+        assert_eq!(by_file.output, PathBuf::from("/from/file"));
+        assert_eq!(by_file.output_origin, Origin::File);
+
+        let by_default = effective_cli(&cli_with(&[]), &world, &config::Config::default());
+        assert_eq!(by_default.output, PathBuf::from(DEFAULT_OUTPUT));
+        assert_eq!(by_default.output_origin, Origin::Default);
+    }
+
+    #[test]
+    fn the_environment_sits_between_the_flag_and_the_file_for_the_model() {
+        let env_model = a_directory("env-model");
+        let file_model = a_directory("file-model");
+        let flag_model = a_directory("flag-model");
+        let world = World {
+            model: Some(env_model.clone()),
+            ..fake_world()
+        };
+        let file = config::Config {
+            model: Some(file_model.clone()),
+            ..Default::default()
+        };
+
+        let by_flag = effective_cli(&cli_with(&["-m", flag_model.to_str().unwrap()]), &world, &file);
+        assert_eq!(by_flag.model, flag_model);
+        assert_eq!(by_flag.model_origin, Origin::Flag);
+
+        let by_env = effective_cli(&cli_with(&[]), &world, &file);
+        assert_eq!(by_env.model, env_model);
+        assert_eq!(by_env.model_origin, Origin::Environment);
+
+        let by_file = effective_cli(&cli_with(&[]), &fake_world(), &file);
+        assert_eq!(by_file.model, file_model);
+        assert_eq!(by_file.model_origin, Origin::File);
+    }
+
+    #[test]
+    fn a_model_path_that_is_not_a_directory_does_not_stop_the_chain() {
+        // The tool has always read a non-existent --model as "not this one": the run fails later,
+        // where the model is needed, naming what it looked for.
+        let file = config::Config {
+            model: Some(a_directory("fallthrough-file-model")),
+            ..Default::default()
+        };
+        let plan = effective_cli(&cli_with(&["-m", "/no/such/model"]), &fake_world(), &file);
+        assert_ne!(plan.model, PathBuf::from("/no/such/model"));
+        assert_eq!(plan.model_origin, Origin::File);
+    }
+
+    #[test]
+    fn a_switch_is_the_flag_or_the_file_and_nothing_else() {
+        let world = fake_world();
+        let with_flag = effective_cli(&cli_with(&["--force"]), &world, &config::Config::default());
+        assert!(with_flag.force && with_flag.force_origin == Origin::Flag);
+
+        let from_file = effective_cli(
+            &cli_with(&[]),
+            &world,
+            &config::Config {
+                force: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(from_file.force && from_file.force_origin == Origin::File);
+
+        let from_nothing = effective_cli(&cli_with(&[]), &world, &config::Config::default());
+        assert!(!from_nothing.force && from_nothing.force_origin == Origin::Default);
+    }
+
+    #[test]
+    fn the_server_walks_the_same_chain() {
+        // The caller's own arguments come first (they are this front's flags), then the
+        // environment, then the file, then the data directory: one chain, two frontes.
+        let from_file = config::Config {
+            output: Some(PathBuf::from("/from/file")),
+            ..Default::default()
+        };
+
+        let caller = effective_mcp(
+            &fake_world(),
+            &config::Config::default(),
+            Some("/from/caller"),
+            None,
+            None,
+        );
+        assert_eq!(caller.output, PathBuf::from("/from/caller"));
+        assert_eq!(caller.output_origin, Origin::Flag);
+
+        let by_env = World {
+            dir: Some(PathBuf::from("/from/env")),
+            ..fake_world()
+        };
+        let by_env = effective_mcp(&by_env, &from_file, None, None, None);
+        assert_eq!(by_env.output, PathBuf::from("/from/env"));
+        assert_eq!(by_env.output_origin, Origin::Environment);
+
+        let by_file = effective_mcp(&fake_world(), &from_file, None, None, None);
+        assert_eq!(by_file.output, PathBuf::from("/from/file"));
+        assert_eq!(by_file.output_origin, Origin::File);
+
+        let by_default = effective_mcp(&fake_world(), &config::Config::default(), None, None, None);
+        assert_eq!(
+            by_default.output,
+            PathBuf::from("/home/fake/.local/share/yt-transcribe")
+        );
+        assert_eq!(by_default.output_origin, Origin::Default);
+    }
+
+    #[test]
+    fn a_run_with_no_file_reads_the_same_values_as_before_the_file_existed() {
+        // CA-U2.3, as a unit: no file anywhere -> the output is `.`, both switches are off, and
+        // nothing about this run depends on the configuration existing.
+        let plan = effective_cli(&cli_with(&[]), &fake_world(), &config::Config::default());
+        assert_eq!(plan.output, PathBuf::from("."));
+        assert!(!plan.force && !plan.force_transcribe);
+        assert!(plan.lang.is_none() && plan.cookies.is_none());
     }
 }
