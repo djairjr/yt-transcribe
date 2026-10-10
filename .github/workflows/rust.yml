@@ -31,13 +31,17 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install what FFmpeg and rsmpeg need
-        # FFmpeg's static build links OpenSSL, and OpenSSL's pkg-config puts its private
-        # dependencies on the link line — measured as
-        # `-lssl -lcrypto -l:libjitterentropy.a -lz -lzstd -ldl -pthread`.
+        # FFmpeg's static build links OpenSSL and libxml2, and their pkg-config files put the private
+        # dependencies on the link line. Two rounds of `unable to find library` / `undefined symbol`
+        # in CI named exactly what was missing:
+        #   `-lssl -lcrypto -l:libjitterentropy.a -lz -lzstd -ldl -pthread`  (OpenSSL)
+        #   `lzma_code`, `lzma_auto_decoder`, `ucnv_open_74`, ...             (the runner's libxml2)
+        # so liblzma-dev and libicu-dev are here because the runner's libxml2 was built with them,
+        # even though this machine's libxml2 pkg-config asks for neither.
         run: |
           sudo apt-get update
           sudo apt-get install -y nasm yasm clang pkg-config libssl-dev libxml2-dev \
-                                  zlib1g-dev libzstd-dev
+                                  zlib1g-dev libzstd-dev liblzma-dev libicu-dev
 
       - name: Provide libjitterentropy, which this Ubuntu does not package
         # This is NOT a wrong package name: the archive index for this release was checked (64,755
