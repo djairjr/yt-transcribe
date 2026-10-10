@@ -143,6 +143,23 @@ Options:
   -V, --version           Print version.
 ```
 
+### Exit codes
+
+One meaning across the family of tools this belongs to, so a script can branch on it without
+knowing which one it called:
+
+| code | meaning |
+|------|---------|
+| `0` | The work is done and nothing needs a person. |
+| `1` | Something needs a person: the run was cancelled (the registry keeps every finished block), or the record carries an error. |
+| `2` | The work could not be done — nothing was attempted, or nothing came out of it. |
+
+A video that fails to decode exits `2`, not `1`: there is no transcript to look at. A run that was
+cancelled halfway exits `1`: there is a partial transcript in the registry, and the next run
+continues from there. The MCP server mode exits `0` when it stops cleanly and `2` for anything else —
+a server that died has no residue for a person to read. `status` says the same thing in more detail,
+and it reads it from disk rather than from the exit code.
+
 ### Output files
 
 Named after the video id (YouTube) or the file stem (local file or URL).

@@ -112,6 +112,17 @@ pub(crate) fn resolve_model(cli_model: &Path) -> PathBuf {
     cli_model.to_path_buf()
 }
 
+/// The exit codes, and there is one meaning for the whole family — a script that calls this tool or
+/// its sibling should not have to know which one it called:
+///
+/// * `0` the work is done and nothing needs a person;
+/// * `1` something needs a person: a cancelled run (the registry keeps every finished block), or a
+///   record that carries an error;
+/// * `2` the work could not be done — nothing was attempted, or nothing came out of it.
+const NOTHING_TO_READ: i32 = 0;
+const READ_ME: i32 = 1;
+const COULD_NOT_WORK: i32 = 2;
+
 fn main() {
     let cli = Cli::parse();
 
@@ -119,10 +130,7 @@ fn main() {
         std::process::exit(serve_mcp(&transport, &address));
     }
 
-    if let Err(e) = transcribe_cli(&cli) {
-        eprintln!("error: {e}");
-        std::process::exit(1);
-    }
+    std::process::exit(transcribe_cli(&cli));
 }
 
 /// Host of an `http(s)` URL, lower-cased, without userinfo or port.
@@ -178,28 +186,43 @@ pub(crate) fn media_error(input: &str, err: Box<dyn Error>) -> Box<dyn Error> {
     .into()
 }
 
-/// Transcribe from the command line, and report where everything landed.
-fn transcribe_cli(cli: &Cli) -> Result<(), Box<dyn Error>> {
+/// Transcribe from the command line, report where everything landed, and say how it went in the
+/// exit code.
+fn transcribe_cli(cli: &Cli) -> i32 {
     let model = resolve_model(&cli.model);
-    std::fs::create_dir_all(&cli.output)?;
+    if let Err(e) = std::fs::create_dir_all(&cli.output) {
+        eprintln!("error: could not use {} as the output directory: {e}", cli.output.display());
+        return COULD_NOT_WORK;
+    }
 
     // Loaded once, before any network work: an unreadable cookie file has to fail
     // here, where the message can name the file, and not midway through a queue.
     // Only the count is ever reported -- never a value.
     let cookies = match cli.cookies.as_deref() {
-        Some(path) => {
-            let jar = ingest::cookies::Jar::load(path)?;
-            eprintln!("cookies: {} entry(ies)", jar.len());
-            Some(jar)
-        }
+        Some(path) => match ingest::cookies::Jar::load(path) {
+            Ok(jar) => {
+                eprintln!("cookies: {} entry(ies)", jar.len());
+                Some(jar)
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return COULD_NOT_WORK;
+            }
+        },
         None => None,
     };
 
-    let source = cli
-        .input
-        .clone()
-        .ok_or("no input given: pass a YouTube URL, an http(s) media URL, or a file")?;
-    let (stem, kind) = run::classify(&source)?;
+    let Some(source) = cli.input.clone() else {
+        eprintln!("error: no input given: pass a YouTube URL, an http(s) media URL, or a file");
+        return COULD_NOT_WORK;
+    };
+    let (stem, kind) = match run::classify(&source) {
+        Ok(classified) => classified,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return COULD_NOT_WORK;
+        }
+    };
     match kind {
         "youtube" => eprintln!("video: {stem}"),
         "network" => eprintln!("url: {source} ({stem})"),
@@ -219,7 +242,13 @@ fn transcribe_cli(cli: &Cli) -> Result<(), Box<dyn Error>> {
     // No signal handler on purpose: Ctrl-C kills the process, the registry already holds every
     // finished block, and the next run picks up from there.
     let cancel = AtomicBool::new(false);
-    let outcome = run::transcribe(&source, &options, &cancel)?;
+    let outcome = match run::transcribe(&source, &options, &cancel) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return failed_exit(&cli.output, &stem);
+        }
+    };
 
     eprintln!(
         "transcribed: wrote {} ({} cues) and {}",
@@ -237,7 +266,29 @@ fn transcribe_cli(cli: &Cli) -> Result<(), Box<dyn Error>> {
             None => String::new(),
         }
     );
-    Ok(())
+    exit_for(&outcome.task)
+}
+
+/// The code for a run that finished: only a run that came out clean has nothing to look at.
+fn exit_for(task: &task::Task) -> i32 {
+    if task.state == "finished" && task.error.is_none() {
+        NOTHING_TO_READ
+    } else {
+        READ_ME
+    }
+}
+
+/// The code for a run that ended in an error.
+///
+/// The record is read from disk because that is where the run left it: blocks already recorded are
+/// something a person may want to look at (and the next run continues from there), while a run that
+/// recorded nothing never did the work. Reading it from disk rather than from memory is the same
+/// rule `status` follows.
+fn failed_exit(dir: &Path, stem: &str) -> i32 {
+    match task::read(dir, stem).ok().flatten() {
+        Some(t) if t.chunks_done > 0 || t.cues > 0 => READ_ME,
+        _ => COULD_NOT_WORK,
+    }
 }
 
 /// Starts the MCP server on the requested transport.
@@ -252,7 +303,7 @@ fn serve_mcp(transport: &str, address: &str) -> i32 {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("error: could not start the async runtime: {e}");
-            return 2;
+            return COULD_NOT_WORK;
         }
     };
 
@@ -261,15 +312,73 @@ fn serve_mcp(transport: &str, address: &str) -> i32 {
         "http" => rt.block_on(mcp::serve_http(address)),
         other => {
             eprintln!("error: unknown transport: {other:?} -- use \"stdio\" or \"http\"");
-            return 2;
+            return COULD_NOT_WORK;
         }
     };
 
     match result {
-        Ok(()) => 0,
+        Ok(()) => NOTHING_TO_READ,
         Err(e) => {
+            // A server that died did not do its work; there is no residue for a person here.
             eprintln!("error in the MCP server: {e}");
-            1
+            COULD_NOT_WORK
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(stem: &str, state: &str, error: Option<&str>, cues: usize, chunks_done: usize) -> task::Task {
+        task::Task {
+            stem: stem.to_string(),
+            state: state.to_string(),
+            error: error.map(str::to_string),
+            cues,
+            chunks_done,
+            ..Default::default()
+        }
+    }
+
+    fn fresh_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("yt-transcribe-exit-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_clean_finished_run_has_nothing_to_read() {
+        assert_eq!(exit_for(&record("doc", "finished", None, 12, 3)), NOTHING_TO_READ);
+    }
+
+    #[test]
+    fn a_cancelled_run_keeps_its_blocks_and_asks_for_a_look() {
+        // The registry is not rolled back, so the partial transcript is exactly what a person
+        // (or the next run) wants to see.
+        assert_eq!(exit_for(&record("doc", "cancelled", None, 4, 2)), READ_ME);
+    }
+
+    #[test]
+    fn a_record_carrying_an_error_asks_for_a_look() {
+        assert_eq!(exit_for(&record("doc", "finished", Some("boom"), 3, 1)), READ_ME);
+    }
+
+    #[test]
+    fn a_run_that_recorded_nothing_could_not_work() {
+        let dir = fresh_dir("nothing");
+        // No record on disk at all: the run died before it wrote one.
+        assert_eq!(failed_exit(&dir, "nothing"), COULD_NOT_WORK);
+        // A record that never got a single block down.
+        task::write(&dir, &record("nothing", "failed", Some("decode"), 0, 0)).unwrap();
+        assert_eq!(failed_exit(&dir, "nothing"), COULD_NOT_WORK);
+    }
+
+    #[test]
+    fn a_run_that_recorded_blocks_has_something_to_look_at() {
+        let dir = fresh_dir("partial");
+        task::write(&dir, &record("partial", "failed", Some("network"), 0, 2)).unwrap();
+        assert_eq!(failed_exit(&dir, "partial"), READ_ME);
     }
 }
