@@ -339,7 +339,20 @@ The export ages: when a request stops authenticating, export again.
 
 ## Building from source
 
-Prerequisites: a C toolchain, `nasm`/`yasm`, `clang` (bindgen), and Rust.
+Prerequisites: a C toolchain, `nasm`/`yasm`, `clang` (bindgen), `pkg-config`, Rust, and the
+development packages the static FFmpeg links against. That list was not written down until the CI
+built this from a clean Ubuntu and named, one at a time, what was missing:
+
+```bash
+sudo apt install nasm yasm clang pkg-config libssl-dev libxml2-dev \
+                 zlib1g-dev libzstd-dev liblzma-dev libicu-dev
+```
+
+plus `libjitterentropy`, **built from source** where the distribution does not package it
+([jitterentropy-library](https://github.com/smuellerDD/jitterentropy-library), tag `v3.6.3`):
+OpenSSL's static libraries reference it, and Ubuntu 24.04 carries no package for it at all — only
+`jitterentropy-rngd` and `jitterdebugger*`. `.github/workflows/rust.yml` installs exactly this list,
+and is the copy that is known to work.
 
 ```bash
 # 1. Fetch the model (~670 MB, int8). Not shipped with the binary.
