@@ -2932,6 +2932,7 @@ version = "0.2.1"
 dependencies = [
  "axum",
  "clap",
+ "libc",
  "parakeet-rs",
  "reqwest",
  "rmcp",

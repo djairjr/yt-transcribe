@@ -14,6 +14,12 @@ serde_json = "1"
 # ASR: NVIDIA Parakeet via ONNX Runtime.
 parakeet-rs = "0.3"
 clap = { version = "4", features = ["derive"] }
+# The SIGINT handler in `main.rs` is the one place this crate needs a C symbol, and `libc` is the
+# honest way to ask for it: the constant and the handler type are named instead of typed by hand.
+# It is already in the tree at v0.2.190 (through bindgen/getrandom/ring), so this adds a direct
+# edge, not a download -- measured 2026-10-10: Cargo.lock gains exactly one line (`"libc"` in this
+# package's own dependency list), and its set of crate names and versions is unchanged.
+libc = "0.2"
 
 # --- MCP server (Fase 3) -----------------------------------------------------
 # `transport-io` is NOT optional: the `server` feature brings `transport-async-rw`, not

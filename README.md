@@ -176,6 +176,32 @@ continues from there. The MCP server mode exits `0` when it stops cleanly and `2
 a server that died has no residue for a person to read. `status` says the same thing in more detail,
 and it reads it from disk rather than from the exit code.
 
+### Stopping a run
+
+`Ctrl-C` asks for a stop; it does not kill the process in the middle of a block.
+
+* The **first** `Ctrl-C` is honoured at the next block boundary: the block in flight finishes and is
+  recorded, so nothing already paid for is thrown away. The record is left as `cancelled` with the
+  blocks it actually finished, and the exit code is `1` — there is a partial transcript to look at.
+* A **second** `Ctrl-C` refuses to wait: the process leaves at once with code `2`. Everything
+  finished is already on disk at that point, because the record is written per block; only the
+  record's `state` is left as `running`, with no process behind it.
+* Running the same command again **resumes**: the recorded blocks are not transcribed twice, and the
+  run continues from the next one until it ends clean with `0`.
+
+Measured here (35-minute media, nine 240-second blocks, 2026-10-10): one `Ctrl-C` inside the second
+block left `state=cancelled`, `chunks_done=2`, 103 cues and exit `1`; the same command again kept
+those 103 cues byte for byte and finished all nine blocks with exit `0`; a second `Ctrl-C` ended the
+process 0.2 s after it arrived, keeping the 53 cues already recorded.
+
+A `Ctrl-C` that arrives before the first block — during the fetch or the decode — is honoured the
+same way, at the first block boundary: the record says `cancelled` with zero blocks and the exit code
+is `1`; the derived `.srt`/`.txt` are then written empty.
+
+The flag is read **between** blocks, never inside one: a half-transcribed block is worse than a block
+never started. The command line installs the handler; the MCP server does not, because its stop is
+the `cancel` tool and a server that caught `SIGINT` would fight what systemd uses to take it down.
+
 ### Output files
 
 Named after the video id (YouTube) or the file stem (local file or URL).
@@ -390,10 +416,18 @@ python3 tests/tier2_test.py
 # Cancel, resume, and the state surviving the process: needs media with several
 # 240-second blocks.
 python3 tests/cancel_resume_test.py /path/to/long-media.avi
+
+# Ctrl-C as a stop rather than a kill: also needs media with several 240-second
+# blocks, because the first interrupt has to land inside one.
+python3 tests/cli_signal_test.py /path/to/long-media.mp4
 ```
 
-`cargo test` covers the cookie file: the host scoping, the expiry rule, the look-alike host, and
-both prefix conventions.
+`cargo test` covers the cookie file (the host scoping, the expiry rule, the look-alike host, and
+both prefix conventions) and the stop request itself: the handler's decision is a function that takes
+its state by reference, so the suite tests the first interrupt and the second without sending a
+signal to the test process — a handler whose only test is "send yourself a SIGINT and hope" would
+take the suite down with it whenever it failed. The real signal, the real child and the real exit
+codes are the Python instrument above.
 
 ### Debian packages
 
