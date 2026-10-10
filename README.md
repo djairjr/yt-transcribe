@@ -43,10 +43,11 @@ The Windows build is not published as an asset; the recipe is under *Building fr
 source*.
 
 ```bash
-sudo dpkg -i yt-transcribe_0.2.0_amd64.deb
-sudo dpkg -i yt-transcribe-model_0.2.0_all.deb   # only if you need ASR
+sudo dpkg -i yt-transcribe_0.2.1_amd64.deb
+sudo dpkg -i yt-transcribe-model_0.2.0_all.deb   # only if you need ASR. The model package
+                                                 # version tracks the weights, not the program.
 
-sha256sum -c yt-transcribe_0.2.0_amd64.deb.sha256   # optional, against the published checksum
+sha256sum -c yt-transcribe_0.2.1_amd64.deb.sha256   # optional, against the published checksum
 ```
 
 The program package also installs the systemd **user** unit, so the MCP server is one command away:
@@ -90,6 +91,21 @@ Underneath it is one binary with one decode core: FFmpeg is linked statically an
 runs in-process on ONNX Runtime, so there is no external media toolchain to install and no audio piped
 between processes. For the YouTube path the video is never downloaded — only the audio track is
 streamed and decoded on the fly.
+
+### Where this belongs: a specialised mini-harness
+
+This is one of a small family of programs built for my own use: **specialised mini-harnesses**. Each
+is a single program that puts a model on one repetitive, long-running job and gives an agent a
+narrow, task-shaped way to ask for the result — `submit` → `status` → `result`, with the state on
+disk. The reason for that shape is to take load off cloud models: whatever can be done on this
+machine, by a **smaller model specialised for that one job**, is done here, and the cloud keeps only
+what genuinely needs it. Here the model is called in this process, from weights on this disk
+(ONNX Runtime, no daemon), and nothing at all goes to the cloud; the rest of the shape — the cue
+registry, the resume, the captions-before-ASR ladder — is what makes a local model usable in
+practice instead of a demo.
+
+Sibling project: [**rustranslator**](https://github.com/djairjr/rustranslator) — the same shape for
+markdown translation, where the local model writes and a cloud model reviews only the residue.
 
 ## How it works
 
@@ -142,6 +158,23 @@ Options:
   -h, --help              Print help.
   -V, --version           Print version.
 ```
+
+### Exit codes
+
+One meaning across the family of tools this belongs to, so a script can branch on it without
+knowing which one it called:
+
+| code | meaning |
+|------|---------|
+| `0` | The work is done and nothing needs a person. |
+| `1` | Something needs a person: the run was cancelled (the registry keeps every finished block), or the record carries an error. |
+| `2` | The work could not be done — nothing was attempted, or nothing came out of it. |
+
+A video that fails to decode exits `2`, not `1`: there is no transcript to look at. A run that was
+cancelled halfway exits `1`: there is a partial transcript in the registry, and the next run
+continues from there. The MCP server mode exits `0` when it stops cleanly and `2` for anything else —
+a server that died has no residue for a person to read. `status` says the same thing in more detail,
+and it reads it from disk rather than from the exit code.
 
 ### Output files
 
@@ -358,8 +391,9 @@ licensed, so someone who only wants the binary should not have to pull them:
 bash packaging/build-deb.sh          # yt-transcribe_<ver>_amd64.deb        (~19 MB)
 bash packaging/build-deb-model.sh    # yt-transcribe-model_<ver>_all.deb    (~432 MB)
 
-sudo dpkg -i yt-transcribe_0.2.0_amd64.deb
-sudo dpkg -i yt-transcribe-model_0.2.0_all.deb   # optional, needs the model
+sudo dpkg -i yt-transcribe_0.2.1_amd64.deb
+sudo dpkg -i yt-transcribe-model_0.2.0_all.deb   # optional, needs the model; its version tracks
+                                                 # the weights, not the program
 
 systemctl --user enable --now yt-transcribe      # the MCP server, on 127.0.0.1:9730
 ```

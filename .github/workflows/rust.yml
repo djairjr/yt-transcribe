@@ -1,0 +1,106 @@
+name: Rust
+
+# What this runs, and what it deliberately does NOT run.
+#
+# The build here is the real one: the same statically linked FFmpeg the release binary carries,
+# built from the pinned tag by the same script. A CI that links some other FFmpeg proves nothing
+# about the artifact users install.
+#
+# NOT covered here, on purpose:
+#   * tests/tier2_test.py   — needs the `mcp` python client AND the 670 MB model package;
+#   * tests/cancel_resume_test.py — needs long media with several 240-second blocks;
+#   * the network paths (YouTube, HLS) — they depend on the outside world and on credentials.
+# Those are run by hand, documented in the README, and saying so is better than a green check that
+# silently skips them.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # The runner's static libxml2 references lzma and ICU, and its pkg-config does not declare them
+  # (this machine's libxml2 asks for neither: `-lxml2 -lm -lz`), so the linker never receives
+  # `-llzma -licuuc` and the link dies with `undefined symbol: lzma_code`, `ucnv_open_74`, ...
+  #
+  # They are handed to the link HERE instead of being added to build-ffmpeg.sh, on purpose: doing it
+  # in the recipe would make the PUBLISHED binary embed ICU statically (~30 MB of libicudata) to
+  # satisfy a quirk of this runner. CI never publishes a binary — it proves the recipe, the code and
+  # the tests — and the release build happens on the machine where the dependency is already
+  # declared. The difference is stated here rather than hidden.
+  RUSTFLAGS: "-C link-arg=-llzma -C link-arg=-licuuc -C link-arg=-licudata"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install what FFmpeg and rsmpeg need
+        # FFmpeg's static build links OpenSSL and libxml2, and their pkg-config files put the private
+        # dependencies on the link line. Two rounds of `unable to find library` / `undefined symbol`
+        # in CI named exactly what was missing:
+        #   `-lssl -lcrypto -l:libjitterentropy.a -lz -lzstd -ldl -pthread`  (OpenSSL)
+        #   `lzma_code`, `lzma_auto_decoder`, `ucnv_open_74`, ...             (the runner's libxml2)
+        # so liblzma-dev and libicu-dev are here because the runner's libxml2 was built with them,
+        # even though this machine's libxml2 pkg-config asks for neither.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm yasm clang pkg-config libssl-dev libxml2-dev \
+                                  zlib1g-dev libzstd-dev liblzma-dev libicu-dev
+
+      - name: Provide libjitterentropy, which this Ubuntu does not package
+        # This is NOT a wrong package name: the archive index for this release was checked (64,755
+        # packages in universe; it carries `jitterentropy-rngd` and `jitterdebugger*` and **no**
+        # libjitterentropy library, dev or runtime). The runner's OpenSSL static libraries still
+        # reference it, so it is built from the pinned upstream tag instead of guessed as a package.
+        # 102 KB to download, seconds to build — cheaper than another failed link.
+        #
+        # It goes into the multiarch library directory, not /usr/local/lib: the Rust link runs
+        # `cc -fuse-ld=lld`, and measured in CI, the linker did NOT find /usr/local/lib. The local
+        # machine has the archive exactly where this copies it, and there the link succeeds.
+        run: |
+          curl -fsSL -o /tmp/jitterentropy.tar.gz \
+            https://github.com/smuellerDD/jitterentropy-library/archive/refs/tags/v3.6.3.tar.gz
+          tar -xzf /tmp/jitterentropy.tar.gz -C /tmp
+          make -C /tmp/jitterentropy-library-3.6.3 -j"$(nproc)"
+          sudo make -C /tmp/jitterentropy-library-3.6.3 install
+          sudo cp /tmp/jitterentropy-library-3.6.3/libjitterentropy.a /usr/lib/x86_64-linux-gnu/
+          sudo cp /tmp/jitterentropy-library-3.6.3/libjitterentropy.so.3.6.3 /usr/lib/x86_64-linux-gnu/
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libjitterentropy.so.3.6.3 \
+                      /usr/lib/x86_64-linux-gnu/libjitterentropy.so
+          sudo ldconfig
+          echo "--- onde o linker procura, para o registro:"
+          gcc -print-search-dirs | sed -n '2p'
+          ls -la /usr/lib/x86_64-linux-gnu/libjitterentropy*
+
+      # The static FFmpeg is reproducible from the script and never versioned (it is ~630 MB of
+      # clone plus the built libs). Cached on the script's own hash: change the configure line and
+      # the cache is rebuilt.
+      - name: Cache the vendored FFmpeg build
+        uses: actions/cache@v4
+        with:
+          path: third_party/ffmpeg-install-net
+          key: ffmpeg-${{ runner.os }}-${{ hashFiles('scripts/build-ffmpeg.sh') }}
+
+      - name: Build the static FFmpeg
+        run: |
+          if [ -f third_party/ffmpeg-install-net/lib/libavformat.a ]; then
+            echo "cache hit: using the vendored FFmpeg already built"
+          else
+            git clone --depth 1 --branch n8.1.3 https://github.com/FFmpeg/FFmpeg.git third_party/ffmpeg
+            FFMPEG_PREFIX="$PWD/third_party/ffmpeg-install-net" bash scripts/build-ffmpeg.sh
+          fi
+
+      - name: Build
+        run: bash scripts/build.sh build --release
+
+      - name: Run the tests
+        run: bash scripts/build.sh test --release
+
+      - name: Smoke — the binary starts and reports its version
+        run: ./target/release/yt-transcribe --version
