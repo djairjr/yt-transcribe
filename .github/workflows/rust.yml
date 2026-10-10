@@ -1,0 +1,63 @@
+name: Rust
+
+# What this runs, and what it deliberately does NOT run.
+#
+# The build here is the real one: the same statically linked FFmpeg the release binary carries,
+# built from the pinned tag by the same script. A CI that links some other FFmpeg proves nothing
+# about the artifact users install.
+#
+# NOT covered here, on purpose:
+#   * tests/tier2_test.py   — needs the `mcp` python client AND the 670 MB model package;
+#   * tests/cancel_resume_test.py — needs long media with several 240-second blocks;
+#   * the network paths (YouTube, HLS) — they depend on the outside world and on credentials.
+# Those are run by hand, documented in the README, and saying so is better than a green check that
+# silently skips them.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install what FFmpeg and rsmpeg need
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm yasm clang pkg-config libssl-dev libxml2-dev
+
+      # The static FFmpeg is reproducible from the script and never versioned (it is ~630 MB of
+      # clone plus the built libs). Cached on the script's own hash: change the configure line and
+      # the cache is rebuilt.
+      - name: Cache the vendored FFmpeg build
+        uses: actions/cache@v4
+        with:
+          path: third_party/ffmpeg-install-net
+          key: ffmpeg-${{ runner.os }}-${{ hashFiles('scripts/build-ffmpeg.sh') }}
+
+      - name: Build the static FFmpeg
+        run: |
+          if [ -f third_party/ffmpeg-install-net/lib/libavformat.a ]; then
+            echo "cache hit: using the vendored FFmpeg already built"
+          else
+            git clone --depth 1 --branch n8.1.3 https://github.com/FFmpeg/FFmpeg.git third_party/ffmpeg
+            FFMPEG_PREFIX="$PWD/third_party/ffmpeg-install-net" bash scripts/build-ffmpeg.sh
+          fi
+
+      - name: Build
+        run: bash scripts/build.sh build --release
+
+      - name: Run the tests
+        run: bash scripts/build.sh test --release
+
+      - name: Smoke — the binary starts and reports its version
+        run: ./target/release/yt-transcribe --version
