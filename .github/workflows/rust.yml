@@ -45,17 +45,24 @@ jobs:
         # libjitterentropy library, dev or runtime). The runner's OpenSSL static libraries still
         # reference it, so it is built from the pinned upstream tag instead of guessed as a package.
         # 102 KB to download, seconds to build — cheaper than another failed link.
+        #
+        # It goes into the multiarch library directory, not /usr/local/lib: the Rust link runs
+        # `cc -fuse-ld=lld`, and measured in CI, the linker did NOT find /usr/local/lib. The local
+        # machine has the archive exactly where this copies it, and there the link succeeds.
         run: |
           curl -fsSL -o /tmp/jitterentropy.tar.gz \
             https://github.com/smuellerDD/jitterentropy-library/archive/refs/tags/v3.6.3.tar.gz
           tar -xzf /tmp/jitterentropy.tar.gz -C /tmp
           make -C /tmp/jitterentropy-library-3.6.3 -j"$(nproc)"
           sudo make -C /tmp/jitterentropy-library-3.6.3 install
-          # The link needs the static archive: copy it explicitly instead of trusting the install
-          # target to have placed it.
-          sudo cp /tmp/jitterentropy-library-3.6.3/libjitterentropy.a /usr/local/lib/
+          sudo cp /tmp/jitterentropy-library-3.6.3/libjitterentropy.a /usr/lib/x86_64-linux-gnu/
+          sudo cp /tmp/jitterentropy-library-3.6.3/libjitterentropy.so.3.6.3 /usr/lib/x86_64-linux-gnu/
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libjitterentropy.so.3.6.3 \
+                      /usr/lib/x86_64-linux-gnu/libjitterentropy.so
           sudo ldconfig
-          ldconfig -p | grep jitterentropy
+          echo "--- onde o linker procura, para o registro:"
+          gcc -print-search-dirs | sed -n '2p'
+          ls -la /usr/lib/x86_64-linux-gnu/libjitterentropy*
 
       # The static FFmpeg is reproducible from the script and never versioned (it is ~630 MB of
       # clone plus the built libs). Cached on the script's own hash: change the configure line and
