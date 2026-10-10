@@ -29,10 +29,23 @@ mod task;
 use clap::{Parser, Subcommand};
 use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[derive(Parser)]
-#[command(name = "yt-transcribe", version, about)]
+#[command(
+    name = "yt-transcribe",
+    version,
+    about,
+    after_help = "\
+Exit codes, one meaning for the whole family:
+  0  the work is done and nothing needs a person
+  1  something needs a person -- a cancelled run, or a record carrying an error
+  2  the work could not be done
+
+Ctrl-C asks the run to stop between blocks: the block in flight finishes and is recorded, the
+record is left as `cancelled`, and the exit code is 1. A second Ctrl-C refuses to wait and exits 2.
+Nothing already recorded is redone, so running the same command again resumes from there."
+)]
 struct Cli {
     /// A YouTube URL, an http(s) media URL (direct file or HLS/DASH playlist),
     /// or a path to a local media file.
@@ -186,6 +199,63 @@ pub(crate) fn media_error(input: &str, err: Box<dyn Error>) -> Box<dyn Error> {
     .into()
 }
 
+/// How many interrupts this process has taken. A `static` because a signal handler can reach nothing
+/// else; it is only ever touched through [`handle_interrupt`].
+static INTERRUPTS: AtomicUsize = AtomicUsize::new(0);
+
+/// The stop a signal asks for: set by the handler, read by the run between ASR blocks.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+/// What an interrupt asks for.
+///
+/// Kept apart from the signal itself so the instrument can be tested without one: a handler whose
+/// only test is "send yourself a SIGINT and hope" would take the whole test suite down with it when
+/// it fails.
+#[derive(Debug, PartialEq, Eq)]
+enum Interrupt {
+    /// The first `Ctrl-C`: finish the block in flight, record it, and leave code 1.
+    StopBetweenBlocks,
+    /// The second: refuse to wait any longer, leave code 2 now.
+    LeaveNow,
+}
+
+/// The body of the handler, taking its state by reference so that a test can own it.
+///
+/// Measured 2026-10-10: the record is written **per block**, so two blocks are on disk while the
+/// third runs. That is what makes the second interrupt safe to honour at once -- the finished work
+/// is already recorded, and only `state` would stay `running`.
+fn handle_interrupt(seen: &AtomicUsize, stop: &AtomicBool) -> Interrupt {
+    if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+        stop.store(true, Ordering::SeqCst);
+        Interrupt::StopBetweenBlocks
+    } else {
+        Interrupt::LeaveNow
+    }
+}
+
+/// Async-signal-safe by construction: it sets a flag and, on the second interrupt, calls `_exit`.
+///
+/// It writes nothing. Writing a file is not async-signal-safe, and nothing here needs it: the
+/// record follows the work, so the block in flight finishes on the normal path and is on disk
+/// before this process leaves.
+extern "C" fn on_sigint(_signal: i32) {
+    if handle_interrupt(&INTERRUPTS, &STOP) == Interrupt::LeaveNow {
+        unsafe { libc::_exit(COULD_NOT_WORK) }
+    }
+}
+
+/// Make `Ctrl-C` ask the run to stop between blocks instead of killing it mid-block.
+///
+/// Only the command line installs this. The MCP server must not: its stop is the `cancel` tool, and
+/// a server that caught SIGINT would ignore what systemd uses to take it down.
+fn install_signal_handler() {
+    // SAFETY: `on_sigint` is an `extern "C"` function with the single `int` parameter `signal(2)`
+    // requires, and `signal` only stores the pointer -- it never calls into Rust here.
+    unsafe {
+        libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
+    }
+}
+
 /// Transcribe from the command line, report where everything landed, and say how it went in the
 /// exit code.
 fn transcribe_cli(cli: &Cli) -> i32 {
@@ -239,10 +309,10 @@ fn transcribe_cli(cli: &Cli) -> i32 {
         verbose: true,
         dump_url: std::env::var("YT_DUMP_URL").is_ok(),
     };
-    // No signal handler on purpose: Ctrl-C kills the process, the registry already holds every
-    // finished block, and the next run picks up from there.
-    let cancel = AtomicBool::new(false);
-    let outcome = match run::transcribe(&source, &options, &cancel) {
+    // Ctrl-C now asks for a stop instead of killing the process mid-block: the block in flight
+    // finishes, the record is written, and the run leaves code 1 with every finished block kept.
+    install_signal_handler();
+    let outcome = match run::transcribe(&source, &options, &STOP) {
         Ok(outcome) => outcome,
         Err(e) => {
             eprintln!("error: {e}");
@@ -380,5 +450,47 @@ mod tests {
         let dir = fresh_dir("partial");
         task::write(&dir, &record("partial", "failed", Some("network"), 0, 2)).unwrap();
         assert_eq!(failed_exit(&dir, "partial"), READ_ME);
+    }
+
+    #[test]
+    fn the_first_interrupt_arms_the_flag_the_run_reads_between_blocks() {
+        // The instrument for the stop request, without a signal in sight: this test process would
+        // not survive its own failure.
+        let seen = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        assert_eq!(handle_interrupt(&seen, &stop), Interrupt::StopBetweenBlocks);
+        assert!(stop.load(Ordering::SeqCst));
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_second_interrupt_refuses_to_wait() {
+        let seen = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        assert_eq!(handle_interrupt(&seen, &stop), Interrupt::StopBetweenBlocks);
+        assert_eq!(handle_interrupt(&seen, &stop), Interrupt::LeaveNow);
+    }
+
+    #[test]
+    fn the_stop_the_handler_arms_is_what_makes_the_run_ask_for_a_look() {
+        // Writer and reader of the same contract in one test: the signal arms the flag, the run
+        // turns that flag into `cancelled`, and a `cancelled` record is code 1 -- not code 0.
+        let seen = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        handle_interrupt(&seen, &stop);
+        let mut stopped = record("doc", "running", None, 4, 2);
+        if stop.load(Ordering::SeqCst) {
+            stopped.state = "cancelled".to_string();
+        }
+        assert_eq!(exit_for(&stopped), READ_ME);
+    }
+
+    #[test]
+    fn the_handler_installs_without_signal_rejecting_it() {
+        // A `sighandler_t` of the wrong shape is what a hand-declared `signal` gets wrong, and the
+        // mistake is silent until a signal arrives. Installing it here, in the suite, catches it.
+        let previous = unsafe { libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t) };
+        assert_ne!(previous, libc::SIG_ERR, "signal() rejected the handler");
+        unsafe { libc::signal(libc::SIGINT, previous) };
     }
 }

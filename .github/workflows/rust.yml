@@ -9,6 +9,7 @@ name: Rust
 # NOT covered here, on purpose:
 #   * tests/tier2_test.py   — needs the `mcp` python client AND the 670 MB model package;
 #   * tests/cancel_resume_test.py — needs long media with several 240-second blocks;
+#   * tests/cli_signal_test.py    — same: the first Ctrl-C has to land inside a 240-second block;
 #   * the network paths (YouTube, HLS) — they depend on the outside world and on credentials.
 # Those are run by hand, documented in the README, and saying so is better than a green check that
 # silently skips them.
