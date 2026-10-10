@@ -91,6 +91,21 @@ runs in-process on ONNX Runtime, so there is no external media toolchain to inst
 between processes. For the YouTube path the video is never downloaded — only the audio track is
 streamed and decoded on the fly.
 
+### Where this belongs: a specialised mini-harness
+
+This is one of a small family of programs built for my own use: **specialised mini-harnesses**. Each
+is a single program that puts a model on one repetitive, long-running job and gives an agent a
+narrow, task-shaped way to ask for the result — `submit` → `status` → `result`, with the state on
+disk. The reason for that shape is to take load off cloud models: whatever can be done on this
+machine, by a **smaller model specialised for that one job**, is done here, and the cloud keeps only
+what genuinely needs it. Here the model is called in this process, from weights on this disk
+(ONNX Runtime, no daemon), and nothing at all goes to the cloud; the rest of the shape — the cue
+registry, the resume, the captions-before-ASR ladder — is what makes a local model usable in
+practice instead of a demo.
+
+Sibling project: [**rustranslator**](https://github.com/djairjr/rustranslator) — the same shape for
+markdown translation, where the local model writes and a cloud model reviews only the residue.
+
 ## How it works
 
 ### YouTube URL
