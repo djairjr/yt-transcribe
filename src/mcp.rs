@@ -170,14 +170,21 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new() -> Self {
+    /// Build the server.
+    ///
+    /// `explicit` is the `--config` path the process was started with, when there was one. It is
+    /// honoured -- and, if it is not there, that is fatal, exactly as it is on the command line:
+    /// measured 2026-10-10, the server used to ignore the named file and come up on the defaults.
+    /// A file the server finds by itself but cannot read is reported and then skipped, because
+    /// every key is optional and the server exists to answer.
+    pub fn try_new(explicit: Option<&Path>) -> Result<Self, String> {
         let world = World::real();
-        // A file the server cannot read is reported and then ignored: the server exists to answer,
-        // and every key is optional -- there is no configuration it could not do without. The
-        // command line is stricter, because there a person is waiting on the answer.
-        let file = match crate::load_config(None, &world) {
+        let file = match crate::load_config(explicit, &world) {
             Ok(file) => file,
             Err(e) => {
+                if explicit.is_some() {
+                    return Err(format!("{e}"));
+                }
                 eprintln!("yt-transcribe mcp: ignoring the configuration: {e}");
                 config::Config::default()
             }
@@ -186,12 +193,13 @@ impl Server {
             "yt-transcribe mcp: model {}",
             crate::resolve_model(&world, None, file.model.as_deref()).0.display()
         );
-        Self {
+        Ok(Self {
             jobs: Arc::new(Jobs::default()),
             world: Arc::new(world),
             file: Arc::new(file),
-        }
+        })
     }
+
 
     /// The chain, walked once per call, with the caller's arguments taking the place of the flags.
     fn plan(&self, dir: Option<&str>, lang: Option<&str>, force: Option<bool>) -> Effective {
@@ -313,6 +321,9 @@ impl Server {
         let model = plan.model.clone();
         let cookies = cookies_from(plan.cookies.as_deref());
         let force = plan.force;
+        // Measured 2026-10-10: this was hardcoded `false`, so a server configured to ignore
+        // captions still answered with captions.
+        let force_transcribe = plan.force_transcribe;
         let lang = plan.lang.clone();
 
         // The job takes copies: the response below still needs the originals.
@@ -329,7 +340,7 @@ impl Server {
                     dir: &job_dir,
                     lang: lang.as_deref(),
                     cookies: cookies.as_ref(),
-                    force_transcribe: false,
+                    force_transcribe,
                     force,
                     verbose: true,
                     // Never: over stdio, stdout is the protocol.
@@ -562,12 +573,16 @@ impl Server {
 }
 
 /// Starts the MCP server over stdio and waits until the client closes.
-pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn serve(config_path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    let server = match Server::try_new(config_path) {
+        Ok(server) => server,
+        Err(e) => return Err(format!("{e}").into()),
+    };
     eprintln!(
         "yt-transcribe mcp: serving over stdio (pid {})",
         std::process::id()
     );
-    let service = Server::new().serve(stdio()).await?;
+    let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
@@ -578,14 +593,20 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
 /// pipes. systemd keeps the process alive but hands pipes to nobody — so "systemd + stdio" is
 /// impossible. Serving over HTTP is the only way for the service to live on its own and answer any
 /// harness that points at the address.
-pub async fn serve_http(address: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn serve_http(
+    address: &str,
+    config_path: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
 
     // One job table -- and one configuration -- for the whole process: a session may submit and
     // another may cancel, and both must see the same jobs and the same chain.
-    let template = Server::new();
+    let template = match Server::try_new(config_path) {
+        Ok(server) => server,
+        Err(e) => return Err(format!("{e}").into()),
+    };
 
     let mcp_service: StreamableHttpService<Server, LocalSessionManager> = StreamableHttpService::new(
         move || Ok(template.clone()),

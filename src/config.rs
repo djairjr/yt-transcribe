@@ -110,6 +110,21 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// A leading `~` becomes the environment's home. Nothing else is touched.
+///
+/// Measured 2026-10-10: without this, `"output": "~/x"` in the configuration file created a
+/// directory literally named `~` in the working directory. The sibling tool has always expanded it,
+/// and a file a person writes with `~` in it means their home.
+pub fn expand_tilde(p: &Path, env: &Environment) -> PathBuf {
+    let text = p.to_string_lossy();
+    let rest = text.strip_prefix('~').map(|r| r.strip_prefix('/').unwrap_or(r));
+    match (rest, &env.home) {
+        (Some(r), Some(home)) => home.join(r),
+        // With no known home the path stays literal -- we do not invent one.
+        _ => PathBuf::from(text.as_ref()),
+    }
+}
+
 /// `$XDG_CONFIG_HOME/yt-transcribe/config.json`, falling back to `~/.config/...`.
 pub fn user_config_path(env: &Environment) -> Option<PathBuf> {
     let base = env
@@ -266,6 +281,27 @@ mod tests {
         };
         let e = resolve(Some(Path::new("/tmp/named-absent-yt.json")), &env).unwrap_err();
         assert!(e.to_string().contains("/tmp/named-absent-yt.json"), "{e}");
+    }
+
+    #[test]
+    fn a_tilde_in_a_configured_path_means_the_home() {
+        // Measured 2026-10-10: the example shipped with `~` and the run created a directory named
+        // literally `~` in the working directory.
+        let env = fake_env();
+        assert_eq!(
+            expand_tilde(Path::new("~/yt-x"), &env),
+            PathBuf::from("/home/fake/yt-x")
+        );
+        assert_eq!(
+            expand_tilde(Path::new("~"), &env),
+            PathBuf::from("/home/fake")
+        );
+        // An absolute path is left alone, and with no home known nothing is invented.
+        assert_eq!(expand_tilde(Path::new("/abs/x"), &env), PathBuf::from("/abs/x"));
+        assert_eq!(
+            expand_tilde(Path::new("~/x"), &Environment::default()),
+            PathBuf::from("~/x")
+        );
     }
 
     #[test]

@@ -43,11 +43,11 @@ The Windows build is not published as an asset; the recipe is under *Building fr
 source*.
 
 ```bash
-sudo dpkg -i yt-transcribe_0.2.2_amd64.deb
+sudo dpkg -i yt-transcribe_0.2.3_amd64.deb
 sudo dpkg -i yt-transcribe-model_0.2.0_all.deb   # only if you need ASR. The model package
                                                  # version tracks the weights, not the program.
 
-sha256sum -c yt-transcribe_0.2.2_amd64.deb.sha256   # optional, against the published checksum
+sha256sum -c yt-transcribe_0.2.3_amd64.deb.sha256   # optional, against the published checksum
 ```
 
 The program package also installs the systemd **user** unit, so the MCP server is one command away:
@@ -118,6 +118,12 @@ markdown translation, where the local model writes and a cloud model reviews onl
 2. **Otherwise, transcribe.** The audio-only format is resolved through the
    innertube player API, streamed over HTTP `Range` requests, decoded to
    16 kHz mono PCM, and passed to the ASR model.
+
+A caption transcript is **finished work**, not a first ASR block: running the same command again over
+one does nothing at all (it says so and exits `0`), instead of "resuming" it and appending ASR text
+from four minutes in. `--force-transcribe` over a caption registry means what it says — ignore the
+captions and transcribe the audio — and it starts a fresh ASR registry rather than mixing the two:
+captions and recognised speech are two different products, and the record says which one it holds.
 
 ### Local media file
 
@@ -195,8 +201,11 @@ those 103 cues byte for byte and finished all nine blocks with exit `0`; a secon
 process 0.2 s after it arrived, keeping the 53 cues already recorded.
 
 A `Ctrl-C` that arrives before the first block — during the fetch or the decode — is honoured the
-same way, at the first block boundary: the record says `cancelled` with zero blocks and the exit code
-is `1`; the derived `.srt`/`.txt` are then written empty.
+same way: the record says `cancelled` and the exit code is `1`. On the local and network routes the
+stop lands at the first block boundary, and the derived `.srt`/`.txt` are written for whatever was
+finished. On the YouTube route, when the video has captions, there is no block to wait for: the
+captions are fetched whole, so they are kept and the record still says `cancelled` — measured
+2026-10-10, before that fix the stop was silently ignored there and the run left `finished` with 0.
 
 The flag is read **between** blocks, never inside one: a half-transcribed block is worse than a block
 never started. The command line installs the handler; the MCP server does not, because its stop is
@@ -498,7 +507,7 @@ licensed, so someone who only wants the binary should not have to pull them:
 bash packaging/build-deb.sh          # yt-transcribe_<ver>_amd64.deb        (~19 MB)
 bash packaging/build-deb-model.sh    # yt-transcribe-model_<ver>_all.deb    (~432 MB)
 
-sudo dpkg -i yt-transcribe_0.2.2_amd64.deb
+sudo dpkg -i yt-transcribe_0.2.3_amd64.deb
 sudo dpkg -i yt-transcribe-model_0.2.0_all.deb   # optional, needs the model; its version tracks
                                                  # the weights, not the program
 
